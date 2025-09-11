@@ -5,6 +5,7 @@ from random import random
 from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
+import warnings
 
 import torch
 from torch import nn, einsum
@@ -13,9 +14,11 @@ from torch.nn import Module, ModuleList
 from torch.amp import autocast
 from torch.utils.data import Dataset, DataLoader
 
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 
 from torchvision import transforms as T, utils
+
+import matplotlib.pyplot as plt
 
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
@@ -711,7 +714,7 @@ class GaussianDiffusion(Module):
 
         x_start = None
 
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+        for time, time_next in tqdm(time_pairs, desc = 'sampling loop with ddim time step'):
             time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
             self_cond = x_start if self.self_condition else None
             pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
@@ -880,8 +883,9 @@ class Trainer:
     def __init__(
         self,
         diffusion_model,
-        folder,
         *,
+        folder='',
+        dataset=None,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
         augment_horizontal_flip = True,
@@ -901,7 +905,8 @@ class Trainer:
         inception_block_idx = 2048,
         max_grad_norm = 1.,
         num_fid_samples = 50000,
-        save_best_and_latest_only = False
+        save_best_and_latest_only = False,
+        use_cpu=False
     ):
         super().__init__()
 
@@ -909,7 +914,8 @@ class Trainer:
 
         self.accelerator = Accelerator(
             split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
+            mixed_precision = mixed_precision_type if amp else 'no',
+            cpu=use_cpu
         )
 
         # model
@@ -931,7 +937,10 @@ class Trainer:
 
         self.batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
-        assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
+        # assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
+
+        if (train_batch_size * gradient_accumulate_every) < 16:
+            warnings.warn(f"WARNING: Your effective batch size (train_batch_size x gradient_accumulate_every) is {train_batch_size * gradient_accumulate_every}, which is less than 16. It is recommended to use at least 16 or above.")
 
         self.train_num_steps = train_num_steps
         self.image_size = diffusion_model.image_size
@@ -939,19 +948,21 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
 
         # dataset and dataloader
-
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
-
+        assert folder != '' or exists(dataset), 'exactly one of folder or dataset must be given'
+        if folder != '':
+            self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        else:
+            self.ds = dataset
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=5)
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
         # optimizer
 
-        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+        self.opt = AdamW(diffusion_model.parameters(), lr = train_lr, betas = adam_betas, weight_decay=1e-4)
 
         # for logging results in a folder periodically
 
@@ -1083,10 +1094,18 @@ class Trainer:
                             batches = num_to_groups(self.num_samples, self.batch_size)
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
 
-                        all_images = torch.cat(all_images_list, dim = 0)
+                        all_images = torch.cat(all_images_list, dim = 0).cpu()
+                        accelerator.print(all_images.shape)
 
-                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+                        # utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+                        grid = utils.make_grid(all_images, nrow=int(math.sqrt(self.num_samples)))
 
+                        plt.figure(figsize=(30,30))
+
+                        plt.imshow(grid[0])#, vmin=torch.min(simulations), vmax=torch.max(simulations))
+                        # plt.axis('off')
+                        plt.savefig(self.results_folder / f"colored_grid{milestone}.png", bbox_inches="tight", pad_inches=0)
+                        plt.close()
                         # whether to calculate fid
 
                         if self.calculate_fid:
@@ -1100,7 +1119,8 @@ class Trainer:
                             self.save("latest")
                         else:
                             self.save(milestone)
-
+                        milestone = self.step // self.save_and_sample_every
+                        self.save(milestone)
                 pbar.update(1)
 
         accelerator.print('training complete')
