@@ -1,5 +1,9 @@
+*.sh
 # Generation results
-results/
+results*/
+
+# Training data
+data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
