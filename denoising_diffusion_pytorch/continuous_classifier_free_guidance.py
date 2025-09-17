@@ -1,7 +1,5 @@
 import math
-import copy
 from pathlib import Path
-from random import random
 from functools import partial
 from collections import namedtuple
 import warnings
@@ -12,10 +10,8 @@ import torch.nn.functional as F
 from torch.amp import autocast
 from torch.utils.data import DataLoader, Dataset
 from torch.optim import AdamW
-from torchvision import utils
 
 from einops import rearrange, reduce, repeat, pack, unpack
-from einops.layers.torch import Rearrange
 
 from accelerate import Accelerator
 
@@ -1080,6 +1076,29 @@ class Trainer:
                 pbar.update(1)
 
         accelerator.print('training complete')
+
+
+def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_size, cond_scale=6, ):
+    if not isinstance(conditioning_variables, torch.Tensor):
+        conditioning_variables = torch.tensor(conditioning_variables).float()
+    if not isinstance(real_outputs, torch.Tensor):
+        real_outputs = torch.tensor(real_outputs).float()
+    model_device = next(model.parameters()).device
+    batches = torch.split(conditioning_variables, inference_batch_size)
+    predictions = []
+    for batch in batches:
+        batch.to(model_device)
+        predictions.append(model.sample(batch, cond_scale=cond_scale))
+
+    predictions = torch.cat(predictions, dim=0)
+    mse = ((predictions - real_outputs) ** 2).mean()
+    mre = (torch.abs(predictions - real_outputs) / (real_outputs + 1e-5)).mean()
+    l2 = torch.linalg.norm(real_outputs - predictions) / torch.linalg.norm(real_outputs)
+    return {
+        "mse": mse,
+        "mre": mre,
+        "l2": l2
+    }
 
 
 # example
