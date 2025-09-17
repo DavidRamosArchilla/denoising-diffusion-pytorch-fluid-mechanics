@@ -1087,8 +1087,8 @@ def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_
     batches = torch.split(conditioning_variables, inference_batch_size)
     predictions = []
     for batch in batches:
-        batch.to(model_device)
-        predictions.append(model.sample(batch, cond_scale=cond_scale))
+        batch = batch.to(model_device)
+        predictions.append(model.sample(batch, cond_scale=cond_scale).cpu())
 
     predictions = torch.cat(predictions, dim=0)
     mse = ((predictions - real_outputs) ** 2).mean()
@@ -1098,7 +1098,7 @@ def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_
         "mse": mse,
         "mre": mre,
         "l2": l2
-    }
+    }, predictions
 
 
 # example
