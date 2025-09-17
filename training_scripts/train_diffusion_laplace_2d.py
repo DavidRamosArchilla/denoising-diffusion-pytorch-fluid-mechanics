@@ -1,9 +1,7 @@
-from scipy.io import loadmat
 import numpy as np
 import torch
 from torch.utils.data import TensorDataset
 from denoising_diffusion_pytorch import Unet, GaussianDiffusion, Trainer
-from scipy.ndimage import zoom
 import shutil
 import os
 
@@ -15,32 +13,26 @@ class TensorDatasetWrapper(TensorDataset):
     def __getitem__(self, index):
         return super().__getitem__(index)[0]
 
-data = loadmat("data/cylinder/cylinder_nektar_wake.mat")
+data = np.load("data/laplace/laplace_dataset_solutions.npy")
+data = data[:, np.newaxis, :, :]  # add channel dimension   
 
-presiones = data['p_star'].reshape(50, 100, -1).transpose(2, 0, 1)
-zoom_factors = (1, 64/50, 128/100)  # (1, 1.28, 1.28), el 1 es para tenerlo vectorizado en la fimension de los samples
-presiones = zoom(presiones, zoom_factors, order=1)  # downsample in x direction
-
-# add channel dimension
-presiones = presiones[:, np.newaxis, :, :]
-print(f"Presiones shape: {presiones.shape}")
-
-dataset = TensorDatasetWrapper(torch.tensor(presiones, dtype=torch.float32))
+dataset = TensorDatasetWrapper(torch.tensor(data, dtype=torch.float32))
 
 model = Unet(
-    dim = 128,
+    dim = 64,
     dim_mults = (1, 2, 4, 8),
     flash_attn = False,
-    channels = 1,  
+    channels = 1,
+    full_attn = False
 )
 
 diffusion = GaussianDiffusion(
     model,
-    image_size = (64, 128),
+    image_size = (64, 64),
     objective = 'pred_noise',  # 'pred_noise' or 'pred_x0'
     beta_schedule="cosine",
     sampling_timesteps=50,
-    timesteps = 500    # number of steps
+    timesteps = 500,    # number of steps
 )
 
 # torch.set_float32_matmul_precision('high')
@@ -51,17 +43,17 @@ print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 1e9} GB")
 
-results_folder = 'results_2d_test_sampling'
+results_folder = 'results/laplace_full_attn_unconditioned'
 
 trainer = Trainer(
     diffusion,
     # 'path/to/your/images',
     dataset=dataset,
-    train_batch_size = 8,
+    train_batch_size = 32,
     train_lr = 8e-5,
     num_samples=9,
-    train_num_steps = 16000,         # total training steps
-    gradient_accumulate_every = 1,    # gradient accumulation steps
+    train_num_steps = 10000,         # total training steps
+    gradient_accumulate_every = 2,    # gradient accumulation steps
     ema_decay = 0.995,                # exponential moving average decay
     # amp = True,                       # turn on mixed precision
     calculate_fid = False,              # whether to calculate fid during training
@@ -75,7 +67,7 @@ shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 
 trainer.train()
 
-trainer.load(8)
+# trainer.load(8)
 
 torch.cuda.empty_cache()  # Clear GPU memory
 trainer.ema.ema_model.eval()  # Ensure eval mode
