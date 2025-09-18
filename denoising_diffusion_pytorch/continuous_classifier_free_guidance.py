@@ -334,7 +334,7 @@ class Unet(nn.Module):
         )
 
         # class embeddings
-        
+        self.cond_dim = cond_dim
         self.null_classes_emb = nn.Parameter(torch.randn(cond_dim))
 
         classes_dim = dim * 4
@@ -505,6 +505,7 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
+# The model assumes that the inputs are normalized in [0, 1]. The model itslef will rescale the data to [-1, 1]
 class GaussianDiffusion(nn.Module):
     def __init__(
         self,
@@ -527,7 +528,7 @@ class GaussianDiffusion(nn.Module):
 
         self.model = model
         self.channels = self.model.channels
-
+        self.cond_dim = self.model.cond_dim
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
         assert isinstance(image_size, (tuple, list)) and len(image_size) == 2, 'image size must be a integer or a tuple/list of two integers'
@@ -819,7 +820,6 @@ class GaussianDiffusion(nn.Module):
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        # TODO: this assumes that the input is in [0, 1]. Change to give an option for not to auto_normalize
         img = normalize_to_neg_one_to_one(img)
         return self.p_losses(img, t, *args, **kwargs)
 
@@ -1038,8 +1038,7 @@ class Trainer:
 
                         with torch.inference_mode():
                             milestone = self.step // self.save_and_sample_every
-                            # TODO: the 2 here is hardcoded for unet cond_dim=2
-                            random_classes = torch.rand((self.num_samples, 2), device=device)
+                            random_classes = torch.rand((self.num_samples, model.cond_dim), device=device)
                             batches = torch.split(random_classes, self.batch_size)
                             accelerator.print(len(batches), self.batch_size, batches[0].shape)
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(classes=n), batches))

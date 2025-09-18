@@ -10,7 +10,7 @@ from torch import nn, einsum, Tensor
 from torch.nn import Module, ModuleList
 import torch.nn.functional as F
 from torch.amp import autocast
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 from torch.utils.data import Dataset, DataLoader
 
 from einops import rearrange, reduce, repeat, pack, unpack
@@ -836,7 +836,8 @@ class Trainer1D(object):
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
-        max_grad_norm = 1.
+        max_grad_norm = 1.,
+        use_cpu=False
     ):
         super().__init__()
 
@@ -844,7 +845,8 @@ class Trainer1D(object):
 
         self.accelerator = Accelerator(
             split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
+            mixed_precision = mixed_precision_type if amp else 'no',
+            cpu=use_cpu
         )
 
         # model
@@ -873,7 +875,7 @@ class Trainer1D(object):
 
         # optimizer
 
-        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+        self.opt = AdamW(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=1e-4)
 
         # for logging results in a folder periodically
 
@@ -943,10 +945,10 @@ class Trainer1D(object):
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
-
+                    data = next(self.dl)#.to(device)
+                    sequence, classes = data[0].to(device), data[1].to(device)
                     with self.accelerator.autocast():
-                        loss = self.model(data)
+                        loss = self.model(sequence, classes=classes)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
@@ -976,7 +978,7 @@ class Trainer1D(object):
 
                         all_samples = torch.cat(all_samples_list, dim = 0)
 
-                        torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+                        torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.pt'))
                         self.save(milestone)
 
                 pbar.update(1)
