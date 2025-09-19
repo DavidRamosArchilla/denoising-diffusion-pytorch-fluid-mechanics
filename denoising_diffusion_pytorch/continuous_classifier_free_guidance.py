@@ -4,6 +4,7 @@ from functools import partial
 from collections import namedtuple
 import warnings
 
+import numpy as np
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
@@ -13,7 +14,7 @@ from torch.optim import AdamW
 
 from einops import rearrange, reduce, repeat, pack, unpack
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DataLoaderConfiguration
 
 from tqdm.auto import tqdm
 from ema_pytorch import EMA
@@ -505,6 +506,21 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
+def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1e-5):
+    """
+    sigmoid schedule
+    proposed in https://arxiv.org/abs/2212.11972 - Figure 8
+    better for images > 64x64, when used during training
+    """
+    steps = timesteps + 1
+    t = torch.linspace(0, timesteps, steps, dtype = torch.float64) / timesteps
+    v_start = torch.tensor(start / tau).sigmoid()
+    v_end = torch.tensor(end / tau).sigmoid()
+    alphas_cumprod = (-((t * (end - start) + start) / tau).sigmoid() + v_end) / (v_end - v_start)
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0, 0.999)
+
 # The model assumes that the inputs are normalized in [0, 1]. The model itslef will rescale the data to [-1, 1]
 class GaussianDiffusion(nn.Module):
     def __init__(
@@ -542,6 +558,8 @@ class GaussianDiffusion(nn.Module):
             betas = linear_beta_schedule(timesteps)
         elif beta_schedule == 'cosine':
             betas = cosine_beta_schedule(timesteps)
+        elif beta_schedule == 'sigmoid':
+            beta_schedule_fn = sigmoid_beta_schedule
         else:
             raise ValueError(f'unknown beta schedule {beta_schedule}')
 
@@ -859,9 +877,9 @@ class Trainer:
         # accelerator
 
         self.accelerator = Accelerator(
-            split_batches = split_batches,
             mixed_precision = mixed_precision_type if amp else 'no',
-            cpu=use_cpu
+            cpu=use_cpu,
+            dataloader_config=DataLoaderConfiguration(split_batches=split_batches)
         )
 
         # model
@@ -924,7 +942,7 @@ class Trainer:
         self.step = 0
 
         # prepare model, dataloader, optimizer with accelerator
-
+        self.cond_dim = diffusion_model.cond_dim
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
         # FID-score computation
@@ -933,6 +951,7 @@ class Trainer:
 
         if self.calculate_fid:
             from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
+
 
             if not is_ddim_sampling:
                 self.accelerator.print(
@@ -1000,7 +1019,7 @@ class Trainer:
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
-
+        all_losses = []
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
@@ -1019,8 +1038,6 @@ class Trainer:
 
                     self.accelerator.backward(loss)
 
-                pbar.set_description(f'loss: {total_loss:.4f}')
-
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
@@ -1031,6 +1048,8 @@ class Trainer:
 
                 self.step += 1
                 if accelerator.is_main_process:
+                    all_losses.append(total_loss)
+                    pbar.set_description(f'loss: {total_loss:.4f}')
                     self.ema.update()
 
                     if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
@@ -1038,9 +1057,8 @@ class Trainer:
 
                         with torch.inference_mode():
                             milestone = self.step // self.save_and_sample_every
-                            random_classes = torch.rand((self.num_samples, model.cond_dim), device=device)
+                            random_classes = torch.rand((self.num_samples, self.cond_dim), device=device)
                             batches = torch.split(random_classes, self.batch_size)
-                            accelerator.print(len(batches), self.batch_size, batches[0].shape)
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(classes=n), batches))
 
                         all_images = torch.cat(all_images_list, dim = 0).cpu()
@@ -1073,7 +1091,21 @@ class Trainer:
                         milestone = self.step // self.save_and_sample_every
                         self.save(milestone)
                 pbar.update(1)
-
+        if accelerator.is_main_process:
+            plt.figure()
+            plt.plot(all_losses, label='Loss')
+            # Compute moving average
+            window_size = 100
+            if len(all_losses) >= window_size:
+                moving_avg = np.convolve(all_losses, np.ones(window_size)/window_size, mode='valid')
+                plt.plot(range(window_size-1, len(all_losses)), moving_avg, label=f'Moving Avg ({window_size})')
+            plt.yscale('log')
+            plt.xlabel('Training Steps')
+            plt.ylabel('Loss (log scale)')
+            plt.title('Training Loss Evolution')
+            plt.legend()
+            plt.savefig(self.results_folder / "loss_evolution.png", bbox_inches="tight", pad_inches=0)
+            plt.close()
         accelerator.print('training complete')
 
 
@@ -1090,6 +1122,9 @@ def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_
         predictions.append(model.sample(batch, cond_scale=cond_scale).cpu())
 
     predictions = torch.cat(predictions, dim=0)
+    nan_values = torch.isnan(predictions)
+    predictions = predictions[~nan_values]
+    real_outputs = real_outputs[~nan_values]
     mse = ((predictions - real_outputs) ** 2).mean()
     mre = (torch.abs(predictions - real_outputs) / (real_outputs + 1e-5)).mean()
     l2 = torch.linalg.norm(real_outputs - predictions) / torch.linalg.norm(real_outputs)

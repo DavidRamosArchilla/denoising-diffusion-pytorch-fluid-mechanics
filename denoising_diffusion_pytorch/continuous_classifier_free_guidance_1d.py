@@ -891,7 +891,7 @@ class Trainer1D(object):
         self.step = 0
 
         # prepare model, dataloader, optimizer with accelerator
-
+        self.cond_dim = diffusion_model.cond_dim
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
     @property
@@ -973,8 +973,9 @@ class Trainer1D(object):
 
                         with torch.no_grad():
                             milestone = self.step // self.save_and_sample_every
-                            batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                            random_classes = torch.rand((self.num_samples, self.cond_dim), device=device)
+                            batches = torch.split(random_classes, self.batch_size)
+                            all_samples_list = list(map(lambda n: self.ema.ema_model.sample(classes=n), batches))
 
                         all_samples = torch.cat(all_samples_list, dim = 0)
 
