@@ -5,6 +5,8 @@ from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
 
+from matplotlib import pyplot as plt
+import numpy as np
 import torch
 from torch import nn, einsum, Tensor
 from torch.nn import Module, ModuleList
@@ -16,7 +18,7 @@ from torch.utils.data import Dataset, DataLoader
 from einops import rearrange, reduce, repeat, pack, unpack
 from einops.layers.torch import Rearrange
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DataLoaderConfiguration
 from ema_pytorch import EMA
 
 from tqdm.auto import tqdm
@@ -204,30 +206,31 @@ class Block(Module):
         x = self.act(x)
         return self.dropout(x)
 
-class ResnetBlock(Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim = None, dropout = 0.):
+class ResnetBlock(nn.Module):
+    def __init__(self, dim, dim_out, *, time_emb_dim = None, classes_emb_dim = None, dropout = 0.):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_emb_dim, dim_out * 2)
-        ) if exists(time_emb_dim) else None
+            nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim_out * 2)
+        ) if exists(time_emb_dim) or exists(classes_emb_dim) else None
 
-        self.block1 = Block(dim, dim_out, dropout = dropout)
-        self.block2 = Block(dim_out, dim_out)
+        self.block1 = Block(dim, dim_out, dropout)
+        self.block2 = Block(dim_out, dim_out, dropout)
         self.res_conv = nn.Conv1d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
-    def forward(self, x, time_emb = None):
+    def forward(self, x, time_emb = None, class_emb = None):
 
         scale_shift = None
-        if exists(self.mlp) and exists(time_emb):
-            time_emb = self.mlp(time_emb)
-            time_emb = rearrange(time_emb, 'b c -> b c 1')
-            scale_shift = time_emb.chunk(2, dim = 1)
+        if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
+            cond_emb = tuple(filter(exists, (time_emb, class_emb)))
+            cond_emb = torch.cat(cond_emb, dim = -1)
+            cond_emb = self.mlp(cond_emb)
+            cond_emb = rearrange(cond_emb, 'b c -> b c 1')
+            scale_shift = cond_emb.chunk(2, dim = 1)
 
         h = self.block1(x, scale_shift = scale_shift)
 
         h = self.block2(h)
-
         return h + self.res_conv(x)
 
 class LinearAttention(Module):
@@ -454,6 +457,7 @@ class Unet1D(Module):
         x = self.mid_block1(x, t, c)
         x = self.mid_attn(x)
         x = self.mid_block2(x, t, c)
+        # maybe_crop = lambda x, h: h[..., :x.shape[-1]] if h.shape[-1] != x.shape[-1] else h
 
         for block1, block2, attn, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim = 1)
@@ -844,9 +848,9 @@ class Trainer1D(object):
         # accelerator
 
         self.accelerator = Accelerator(
-            split_batches = split_batches,
             mixed_precision = mixed_precision_type if amp else 'no',
-            cpu=use_cpu
+            cpu=use_cpu,
+            dataloader_config=DataLoaderConfiguration(split_batches=split_batches)
         )
 
         # model
@@ -894,6 +898,8 @@ class Trainer1D(object):
         self.cond_dim = diffusion_model.cond_dim
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
+        self.loss_history = []
+
     @property
     def device(self):
         return self.accelerator.device
@@ -908,7 +914,8 @@ class Trainer1D(object):
             'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
-            'version': __version__
+            'version': __version__,
+            'loss_history': torch.tensor(self.loss_history)
         }
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
@@ -932,6 +939,8 @@ class Trainer1D(object):
 
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
+
+        self.loss_history = data['loss_history'].tolist()
 
     def train(self):
         accelerator = self.accelerator
@@ -966,6 +975,7 @@ class Trainer1D(object):
 
                 self.step += 1
                 if accelerator.is_main_process:
+                    self.loss_history.append(total_loss)
                     self.ema.update()
 
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
@@ -983,5 +993,20 @@ class Trainer1D(object):
                         self.save(milestone)
 
                 pbar.update(1)
-
+                
+        if accelerator.is_main_process:
+            plt.figure()
+            plt.plot(self.loss_history, label='Loss')
+            # Compute moving average
+            window_size = 100
+            if len(self.loss_history) >= window_size:
+                moving_avg = np.convolve(self.loss_history, np.ones(window_size)/window_size, mode='valid')
+                plt.plot(range(window_size-1, len(self.loss_history)), moving_avg, label=f'Moving Avg ({window_size})')
+            plt.yscale('log')
+            plt.xlabel('Training Steps')
+            plt.ylabel('Loss (log scale)')
+            plt.title('Training Loss Evolution')
+            plt.legend()
+            plt.savefig(self.results_folder / "loss_evolution.png", bbox_inches="tight", pad_inches=0)
+            plt.close()
         accelerator.print('training complete')

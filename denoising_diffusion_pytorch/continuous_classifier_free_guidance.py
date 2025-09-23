@@ -180,11 +180,12 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
 # building block modules
 
 class Block(nn.Module):
-    def __init__(self, dim, dim_out):
+    def __init__(self, dim, dim_out, dropout = 0.):
         super().__init__()
         self.proj = nn.Conv2d(dim, dim_out, 3, padding = 1)
         self.norm = RMSNorm(dim_out)
         self.act = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, scale_shift = None):
         x = self.proj(x)
@@ -195,7 +196,7 @@ class Block(nn.Module):
             x = x * (scale + 1) + shift
 
         x = self.act(x)
-        return x
+        return self.dropout(x)
 
 class ResnetBlock(nn.Module):
     def __init__(self, dim, dim_out, *, time_emb_dim = None, classes_emb_dim = None):
@@ -976,6 +977,7 @@ class Trainer:
             self.best_fid = 1e10 # infinite
 
         self.save_best_and_latest_only = save_best_and_latest_only
+        self.all_losses = []
 
     @property
     def device(self):
@@ -991,7 +993,8 @@ class Trainer:
             'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
-            'version': __version__
+            'version': __version__,
+            'loss_history': torch.tensor(self.all_losses)
         }
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
@@ -1015,11 +1018,12 @@ class Trainer:
 
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
+        
+        self.all_losses = data['loss_history'].tolist()
 
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
-        all_losses = []
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
@@ -1048,8 +1052,9 @@ class Trainer:
 
                 self.step += 1
                 if accelerator.is_main_process:
-                    all_losses.append(total_loss)
+                    self.all_losses.append(total_loss)
                     pbar.set_description(f'loss: {total_loss:.4f}')
+                    pbar.update(1)
                     self.ema.update()
 
                     if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
@@ -1090,15 +1095,15 @@ class Trainer:
                             self.save(milestone)
                         milestone = self.step // self.save_and_sample_every
                         self.save(milestone)
-                pbar.update(1)
+                
         if accelerator.is_main_process:
             plt.figure()
-            plt.plot(all_losses, label='Loss')
+            plt.plot(self.all_losses, label='Loss')
             # Compute moving average
             window_size = 100
-            if len(all_losses) >= window_size:
-                moving_avg = np.convolve(all_losses, np.ones(window_size)/window_size, mode='valid')
-                plt.plot(range(window_size-1, len(all_losses)), moving_avg, label=f'Moving Avg ({window_size})')
+            if len(self.all_losses) >= window_size:
+                moving_avg = np.convolve(self.all_losses, np.ones(window_size)/window_size, mode='valid')
+                plt.plot(range(window_size-1, len(self.all_losses)), moving_avg, label=f'Moving Avg ({window_size})')
             plt.yscale('log')
             plt.xlabel('Training Steps')
             plt.ylabel('Loss (log scale)')
@@ -1123,7 +1128,9 @@ def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_
 
     predictions = torch.cat(predictions, dim=0)
     nan_values = torch.isnan(predictions)
+    print(predictions.shape)
     predictions = predictions[~nan_values]
+    print(predictions.shape)
     real_outputs = real_outputs[~nan_values]
     mse = ((predictions - real_outputs) ** 2).mean()
     mre = (torch.abs(predictions - real_outputs) / (real_outputs + 1e-5)).mean()
