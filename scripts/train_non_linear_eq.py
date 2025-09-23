@@ -5,6 +5,10 @@ from denoising_diffusion_pytorch.continuous_classifier_free_guidance import Unet
 import shutil
 import os
 import matplotlib.pyplot as plt
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+
 
 
 data = np.load("data/non_linear_eq/non_linear_train_solutions.npy")
@@ -14,22 +18,22 @@ data = (data - data_min) / (data_max - data_min)  # scale to [0, 1]
 data = data[:, np.newaxis, :, :]  # add channel dimension   
 parameters = np.load("data/non_linear_eq/non_linear_train_parameters.npy")
 # normalize parameters to [0, 1]
-parameters_min, parameters_max = parameters.min(axis=0), parameters.max(axis=0)
-parameters = (parameters - parameters_min) / (parameters_max - parameters_min)
+parameters_mean, parameters_std = parameters.mean(axis=0), parameters.std(axis=0)
+parameters = (parameters - parameters_mean) / (parameters_std)
 
 # load test data
 test_data = np.load("data/non_linear_eq/non_linear_test_solutions.npy")
 test_data = (test_data - data_min) / (data_max - data_min) 
 test_data = test_data[:, np.newaxis, :, :]
 test_parameters = np.load("data/non_linear_eq/non_linear_test_parameters.npy")
-test_parameters = (test_parameters - parameters_min) / (parameters_max - parameters_min)
+test_parameters = (test_parameters - parameters_mean) / (parameters_std)
 
 dataset = TensorDataset(torch.tensor(data, dtype=torch.float32), torch.tensor(parameters, dtype=torch.float32))
 test_dataset = TensorDataset(torch.tensor(test_data, dtype=torch.float32), torch.tensor(test_parameters, dtype=torch.float32))
 
 model = Unet(
-    dim = 64,
-    dim_mults = (1, 2, 4, 8),
+    dim = 128,
+    dim_mults = (1, 2, 4),#, 8),
     # flash_attn = False,
     channels = 1,
     cond_dim=2,
@@ -41,15 +45,16 @@ diffusion = GaussianDiffusion(
     image_size = (64, 64),
     objective = 'pred_noise',  # 'pred_noise' or 'pred_x0'
     beta_schedule="cosine",
-    sampling_timesteps=50,
-    timesteps = 1000,    # number of steps
+    sampling_timesteps=1000,
+    timesteps=1000,    # number of steps
+    # use_cfg_plus_plus=True
 )
 
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 1e9} GB")
 
-results_folder = 'results/non_linear_eq_big'
+results_folder = 'results/non_linear_eq_big_128_bs'
 
 trainer = Trainer(
     diffusion,
@@ -58,8 +63,8 @@ trainer = Trainer(
     train_batch_size = 32,
     train_lr = 8e-5,
     num_samples=9,
-    train_num_steps = 10000,         # total training steps
-    gradient_accumulate_every = 2,    # gradient accumulation steps
+    train_num_steps = 30004,         # total training steps
+    gradient_accumulate_every = 4,    # gradient accumulation steps
     ema_decay = 0.995,                # exponential moving average decay
     # amp = True,                       # turn on mixed precision
     calculate_fid = False,              # whether to calculate fid during training
@@ -71,18 +76,20 @@ trainer = Trainer(
 
 # save this script in the results folder for reference
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
-
-# trainer.train()
-trainer.load(5)
+# trainer.load(1)
+trainer.train()
+# trainer.load(5)
 # torch.cuda.empty_cache()  # Clear GPU memory
-trainer.ema.ema_model.eval()  # Ensure eval mode
+# trainer.ema.ema_model.eval()  # Ensure eval mode
+diffusion = trainer.accelerator.unwrap_model(diffusion)
 diffusion.eval()
 
 errors, samples = evaluate_model(
-    diffusion,
+    diffusion, # trainer.ema.ema_model, #
     test_parameters,
     test_data,
     32,
+    cond_scale=6
 )
 print(f"Final errors:\n{errors}")
 torch.save(samples, f"{results_folder}/test_predictions.pt")
