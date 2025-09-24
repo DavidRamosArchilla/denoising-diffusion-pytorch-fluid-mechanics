@@ -65,7 +65,7 @@ dataset = TensorDataset(torch.tensor(data, dtype=torch.float32), torch.tensor(pa
 
 model = Unet1D(
     dim = 64,
-    dim_mults=(1, 2),#, 4),#, 8),
+    dim_mults=(1, 2, 4, 8),
     # flash_attn = False,
     channels=2,
     cond_dim=2,
@@ -77,7 +77,7 @@ diffusion = GaussianDiffusion1D(
     seq_length=298, # 298 points of the airfoil + 2 padding --> 300 (which is divisible by 4)
     objective='pred_noise',  # 'pred_noise' or 'pred_x0'
     beta_schedule="cosine",
-    sampling_timesteps=250,
+    sampling_timesteps=1000,
     timesteps=1000,    # number of steps
     # use_cfg_plus_plus=False
 )
@@ -86,21 +86,21 @@ print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 1e9} GB")
 
-results_folder = 'results/frist_dlr'
+results_folder = 'results/dlr_big'
 
 trainer = Trainer1D(
     diffusion,
     # 'path/to/your/images',
     dataset=dataset,
-    train_batch_size = 32,
-    train_lr = 8e-5,
+    train_batch_size=16,
+    train_lr=8e-5,
     num_samples=9,
-    train_num_steps = 10004,         # total training steps
-    gradient_accumulate_every=1,    # gradient accumulation steps
-    ema_decay = 0.995,                # exponential moving average decay
+    train_num_steps=30004,  # total training steps
+    gradient_accumulate_every=1,  # gradient accumulation steps
+    ema_decay=0.995,  # exponential moving average decay
     # amp = True,                       # turn on mixed precision
-    results_folder = results_folder,  # folder to save results to
-    save_and_sample_every=2000,
+    results_folder=results_folder,  # folder to save results to
+    save_and_sample_every=2500,
     # use_cpu=True
 )
 

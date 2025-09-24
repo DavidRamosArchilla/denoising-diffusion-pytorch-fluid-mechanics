@@ -457,13 +457,18 @@ class Unet1D(Module):
         x = self.mid_block1(x, t, c)
         x = self.mid_attn(x)
         x = self.mid_block2(x, t, c)
-        # maybe_crop = lambda x, h: h[..., :x.shape[-1]] if h.shape[-1] != x.shape[-1] else h
+        # adds pad to x (the fisrt tensor) so that the second tensor has the same length on the last dimension as the first one 
+        maybe_pad = lambda x, h: F.pad(x, (0, h.shape[-1] - x.shape[-1])) if h.shape[-1] != x.shape[-1] else x
 
         for block1, block2, attn, upsample in self.ups:
-            x = torch.cat((x, h.pop()), dim = 1)
+            res_connection = h.pop()
+            x = maybe_pad(x, res_connection) # check if x needs to be padded
+            x = torch.cat((x, res_connection), dim = 1)
             x = block1(x, t, c)
 
-            x = torch.cat((x, h.pop()), dim = 1)
+            res_connection = h.pop()
+            x = maybe_pad(x, res_connection)
+            x = torch.cat((x, res_connection), dim = 1)
             x = block2(x, t, c)
             x = attn(x)
 
@@ -872,7 +877,7 @@ class Trainer1D(object):
 
         # dataset and dataloader
 
-        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 4)
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
@@ -939,8 +944,9 @@ class Trainer1D(object):
 
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
-
-        self.loss_history = data['loss_history'].tolist()
+            
+        if exists(data['loss_history']):
+            self.loss_history = data['loss_history'].tolist()
 
     def train(self):
         accelerator = self.accelerator
@@ -963,7 +969,6 @@ class Trainer1D(object):
 
                     self.accelerator.backward(loss)
 
-                pbar.set_description(f'loss: {total_loss:.4f}')
 
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -976,6 +981,7 @@ class Trainer1D(object):
                 self.step += 1
                 if accelerator.is_main_process:
                     self.loss_history.append(total_loss)
+                    pbar.set_description(f'loss: {total_loss:.4f}')
                     self.ema.update()
 
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
