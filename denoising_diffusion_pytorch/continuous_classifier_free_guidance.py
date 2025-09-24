@@ -920,7 +920,7 @@ class Trainer:
             self.ds = dataset
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
-        dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=5)
+        dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=4)
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
@@ -1019,7 +1019,8 @@ class Trainer:
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
         
-        self.all_losses = data['loss_history'].tolist()
+        if exists(data['loss_history']):
+            self.all_losses = data['loss_history'].tolist()
 
     def train(self):
         accelerator = self.accelerator
