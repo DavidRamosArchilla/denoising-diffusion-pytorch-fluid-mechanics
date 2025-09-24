@@ -206,7 +206,7 @@ class AnalyticalFunctionDataset:
 # Example usage
 if __name__ == "__main__":
     # Initialize generator
-    generator = AnalyticalFunctionDataset(nx=64, ny=64, x_range=(0, 2*np.pi), y_range=(0, 2*np.pi))
+    generator = AnalyticalFunctionDataset(nx=1024, ny=1024, x_range=(0, 2*np.pi), y_range=(0, 2*np.pi))
     
     # Method 1: Random sampling
     print("\n" + "="*50)
@@ -220,7 +220,7 @@ if __name__ == "__main__":
     )
     
     # Save random dataset
-    generator.save_dataset(solutions_random, parameters_random, "analytical_random")
+    generator.save_dataset(solutions_random, parameters_random, "train_high_resolution")
     
     # Analyze dataset
     generator.analyze_dataset(solutions_random, parameters_random)
@@ -229,21 +229,21 @@ if __name__ == "__main__":
     generator.visualize_samples(solutions_random, parameters_random, n_samples=4)
     
     # Method 2: Grid sampling (optional)
-    print("\n" + "="*50)
-    print("METHOD 2: Regular Grid Sampling")
-    print("="*50)
+    # print("\n" + "="*50)
+    # print("METHOD 2: Regular Grid Sampling")
+    # print("="*50)
     
-    alpha1_grid = np.linspace(-2, 2, 10)
-    alpha2_grid = np.linspace(-2, 2, 10)
+    # alpha1_grid = np.linspace(-2, 2, 10)
+    # alpha2_grid = np.linspace(-2, 2, 10)
     
-    solutions_grid, parameters_grid = generator.generate_grid_dataset(alpha1_grid, alpha2_grid)
+    # solutions_grid, parameters_grid = generator.generate_grid_dataset(alpha1_grid, alpha2_grid)
     
-    # Save grid dataset
-    generator.save_dataset(solutions_grid, parameters_grid, "analytical_grid")
+    # # Save grid dataset
+    # generator.save_dataset(solutions_grid, parameters_grid, "analytical_grid")
     
-    # Analyze grid dataset
-    generator.analyze_dataset(solutions_grid, parameters_grid)
+    # # Analyze grid dataset
+    # generator.analyze_dataset(solutions_grid, parameters_grid)
     
-    print("\n" + "="*50)
-    print("DATASETS READY FOR CNN TRAINING!")
-    print("="*50)
+    # print("\n" + "="*50)
+    # print("DATASETS READY FOR CNN TRAINING!")
+    # print("="*50)
