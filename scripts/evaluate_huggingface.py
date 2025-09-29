@@ -75,6 +75,7 @@ def sample_from_params(params, num_inference_steps=1000):
 samples = sample_from_params(test_parameters)
 
 samples = samples.cpu().numpy()
+np.save("test_predictions.npy", samples)
 num_samples = 9   # how many test cases to generate
 
 def plot_images_grid(images, input_parameters, save_path):
@@ -98,14 +99,13 @@ plot_images_grid(
     f"test_true_values.png"
 )
 
-plt.figure(figsize=(12, 6))
-for i in range(num_samples):
-    plt.subplot(2, num_samples // 2, i + 1)
-    plt.imshow(samples[i, 0], cmap="viridis")  # assuming grayscale
-    plt.axis("off")
-plt.suptitle("Generated Test Predictions", fontsize=16)
-plt.tight_layout()
-plt.savefig("test_predictions.png")
-plt.show()
-
 print(f"MSE: {((test_data - samples)**2).mean()}")
+# plt.figure(figsize=(12, 6))
+# for i in range(num_samples):
+#     plt.subplot(2, num_samples // 2, i + 1)
+#     plt.imshow(samples[i, 0], cmap="viridis")  # assuming grayscale
+#     plt.axis("off")
+# plt.suptitle("Generated Test Predictions", fontsize=16)
+# plt.tight_layout()
+# plt.savefig("test_predictions.png")
+# plt.show()
