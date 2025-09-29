@@ -884,7 +884,7 @@ class Trainer1D(object):
 
         # optimizer
 
-        self.opt = AdamW(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=1e-4)
+        self.opt = AdamW(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=1e-4, fused=True)
 
         # for logging results in a folder periodically
 

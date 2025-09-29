@@ -22,25 +22,7 @@ if torch.cuda.is_available():
     print(f"Current device name: {torch.cuda.get_device_name()}")
 
 
-def show_gpu_info():
-    if not torch.cuda.is_available():
-        print("CUDA is not available")
-        return
-    
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA version: {torch.version.cuda}")
-    print(f"Number of GPUs: {torch.cuda.device_count()}")
-    
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        print(f"\nGPU {i}: {props.name}")
-        print(f"  Compute capability: {props.major}.{props.minor}")
-        print(f"  Total memory: {props.total_memory / 1e9:.1f} GB")
-        print(f"  Multi-processors: {props.multi_processor_count}")
-
-show_gpu_info()
-
-data = np.load("data/dlr_airfoils/cp_train.npy")
+data = np.load("data/dlr_airfoils/cp_train_small.npy")
 # at the moment the model expects inputs in [0, 1], like grayscale images 
 data_min, data_max = data.min(), data.max()
 data = (data - data_min) / (data_max - data_min)  # scale to [0, 1]
@@ -50,7 +32,7 @@ pad_width = ((0, 0),    # No padding for the N samples dimension
              (1, 1))    # Add 1 element before and 1 after the sequence dimension
 # data = np.pad(data, pad_width=pad_width, mode='constant', constant_values=0)
 
-parameters = np.load("data/dlr_airfoils/conditions_train.npy")
+parameters = np.load("data/dlr_airfoils/conditions_train_small.npy")
 parameters_mean, parameters_std = parameters.mean(axis=0), parameters.std(axis=0)
 parameters = (parameters - parameters_mean) / (parameters_std)
 
@@ -64,7 +46,7 @@ test_parameters = (test_parameters - parameters_mean) / (parameters_std)
 dataset = TensorDataset(torch.tensor(data, dtype=torch.float32), torch.tensor(parameters, dtype=torch.float32))
 
 model = Unet1D(
-    dim = 64,
+    dim = 32,
     dim_mults=(1, 2, 4, 8),
     # flash_attn = False,
     channels=2,
@@ -86,16 +68,16 @@ print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 1e9} GB")
 
-results_folder = 'results/dlr_big'
+results_folder = 'results/dlr_small_bs_8_less_data'
 
 trainer = Trainer1D(
     diffusion,
     # 'path/to/your/images',
     dataset=dataset,
-    train_batch_size=16,
+    train_batch_size=8,
     train_lr=8e-5,
     num_samples=9,
-    train_num_steps=30004,  # total training steps
+    train_num_steps=50004,  # total training steps
     gradient_accumulate_every=1,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
     # amp = True,                       # turn on mixed precision
@@ -103,11 +85,11 @@ trainer = Trainer1D(
     save_and_sample_every=2500,
     # use_cpu=True
 )
-
+torch.cuda.empty_cache()
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
-# trainer.load(1)
+# trainer.load(20)
 trainer.train()
-# trainer.load(5)
+# trainer.load(20)
 diffusion = trainer.accelerator.unwrap_model(diffusion)
 diffusion.eval()
 

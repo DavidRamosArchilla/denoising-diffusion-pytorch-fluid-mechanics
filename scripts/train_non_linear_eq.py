@@ -11,12 +11,15 @@ if torch.cuda.is_available():
 
 
 
-data = np.load("data/non_linear_eq/non_linear_train_solutions.npy")
+# data = np.load("data/non_linear_eq/non_linear_train_solutions.npy")
+data = np.load("data/non_linear_eq_latents/train_latents.npy") 
 # at the moment the model expects inputs in [0, 1], like grayscale images 
 data_min, data_max = data.min(), data.max()
 data = (data - data_min) / (data_max - data_min)  # scale to [0, 1]
-data = data[:, np.newaxis, :, :]  # add channel dimension   
-parameters = np.load("data/non_linear_eq/non_linear_train_parameters.npy")
+# data = data[:, np.newaxis, :, :]  # add channel dimension   
+print(data.shape)
+# parameters = np.load("data/non_linear_eq/non_linear_train_parameters.npy")
+parameters = np.load("data/non_linear_eq_latents/train_parameters.npy") 
 # normalize parameters to [0, 1]
 parameters_mean, parameters_std = parameters.mean(axis=0), parameters.std(axis=0)
 parameters = (parameters - parameters_mean) / (parameters_std)
@@ -28,6 +31,13 @@ test_data = test_data[:, np.newaxis, :, :]
 test_parameters = np.load("data/non_linear_eq/non_linear_test_parameters.npy")
 test_parameters = (test_parameters - parameters_mean) / (parameters_std)
 
+extrapolation_data = np.load("data/non_linear_eq/non_linear_extrapolate_solutions.npy")
+extrapolation_data = (extrapolation_data - data_min) / (data_max - data_min) 
+extrapolation_data = extrapolation_data[:, np.newaxis, :, :]
+
+extrapolation_parameters = np.load("data/non_linear_eq/non_linear_extrapolate_parameters.npy")
+extrapolation_parameters = (extrapolation_parameters - parameters_mean) / (parameters_std)
+
 dataset = TensorDataset(torch.tensor(data, dtype=torch.float32), torch.tensor(parameters, dtype=torch.float32))
 test_dataset = TensorDataset(torch.tensor(test_data, dtype=torch.float32), torch.tensor(test_parameters, dtype=torch.float32))
 
@@ -35,14 +45,14 @@ model = Unet(
     dim = 128,
     dim_mults = (1, 2, 4),#, 8),
     # flash_attn = False,
-    channels = 1,
+    channels = 4, # 4 for the latent representations
     cond_dim=2,
     # full_attn = False
 )
 
 diffusion = GaussianDiffusion(
     model,
-    image_size = (64, 64),
+    image_size = (256, 256),
     objective = 'pred_noise',  # 'pred_noise' or 'pred_x0'
     beta_schedule="cosine",
     sampling_timesteps=1000,
@@ -54,7 +64,7 @@ print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 1e9} GB")
 
-results_folder = 'results/non_linear_eq_big_128_bs'
+results_folder = 'results/non_linear_eq_big_latent'
 
 trainer = Trainer(
     diffusion,
@@ -76,9 +86,9 @@ trainer = Trainer(
 
 # save this script in the results folder for reference
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
-# trainer.load(1)
+# trainer.load(6)
 trainer.train()
-# trainer.load(5)
+# trainer.load(15)
 # torch.cuda.empty_cache()  # Clear GPU memory
 # trainer.ema.ema_model.eval()  # Ensure eval mode
 diffusion = trainer.accelerator.unwrap_model(diffusion)
@@ -86,18 +96,18 @@ diffusion.eval()
 
 errors, samples = evaluate_model(
     diffusion, # trainer.ema.ema_model, #
-    test_parameters,
-    test_data,
-    32,
+    parameters[:50],
+    data[:50],
+    128,
     cond_scale=6
 )
 print(f"Final errors:\n{errors}")
-torch.save(samples, f"{results_folder}/test_predictions.pt")
+torch.save(samples, f"{results_folder}/latents_predictions.pt")
 
 def plot_images_grid(images, input_parameters, save_path):
     fig, axes = plt.subplots(int(np.sqrt(len(images))), int(np.sqrt(len(images))), figsize=(12,12))
     for i, ax in enumerate(axes.flat):
-        im = ax.imshow(images[i].squeeze())
+        im = ax.imshow(images[i].squeeze(), cmap='RdBu_r')
         ax.set_title(f"Alpha1={input_parameters[i][0].item():.2f}, Alpha2={input_parameters[i][1].item():.2f}")
         plt.colorbar(im, ax=ax)
         ax.axis('off')
@@ -105,19 +115,19 @@ def plot_images_grid(images, input_parameters, save_path):
 
 model_device = next(diffusion.parameters()).device
 num_images = 9
-inputs_to_plot = test_parameters[:num_images]
-real_values_to_plot = test_data[:num_images]
+inputs_to_plot = (extrapolation_parameters[:num_images] * parameters_std) - parameters_mean
+real_values_to_plot = extrapolation_data[:num_images]
 predictions_to_plot = diffusion.sample(torch.tensor(inputs_to_plot, dtype=torch.float32).to(model_device)).cpu().numpy()
 
-plot_images_grid(
-    predictions_to_plot,
-    inputs_to_plot,
-    f"{results_folder}/test_predictions.png"
-)
+# plot_images_grid(
+#     predictions_to_plot,
+#     inputs_to_plot,
+#     f"{results_folder}/extrapolation_predictions.png"
+# )
 
-plot_images_grid(
-    real_values_to_plot,
-    inputs_to_plot,
-    f"{results_folder}/test_true_values.png"
-)
+# plot_images_grid(
+#     real_values_to_plot,
+#     inputs_to_plot,
+#     f"{results_folder}/extrapolation_true_values.png"
+# )
 plt.close()
