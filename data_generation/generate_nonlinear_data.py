@@ -206,7 +206,7 @@ class AnalyticalFunctionDataset:
 # Example usage
 if __name__ == "__main__":
     # Initialize generator
-    generator = AnalyticalFunctionDataset(nx=1024, ny=1024, x_range=(0, 2*np.pi), y_range=(0, 2*np.pi))
+    generator = AnalyticalFunctionDataset(nx=512, ny=512, x_range=(0, 2*np.pi), y_range=(0, 2*np.pi))
     
     # Method 1: Random sampling
     print("\n" + "="*50)
@@ -220,7 +220,7 @@ if __name__ == "__main__":
     )
     
     # Save random dataset
-    generator.save_dataset(solutions_random, parameters_random, "train_high_resolution")
+    generator.save_dataset(solutions_random, parameters_random, "train_medium_resolution")
     
     # Analyze dataset
     generator.analyze_dataset(solutions_random, parameters_random)
