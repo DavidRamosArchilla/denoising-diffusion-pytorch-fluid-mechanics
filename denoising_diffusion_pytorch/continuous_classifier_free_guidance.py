@@ -1075,7 +1075,11 @@ class Trainer:
                         fig, axes = plt.subplots(3, 3, figsize=(12,12))
 
                         for i, ax in enumerate(axes.flat):
-                            im = ax.imshow(all_images[i].squeeze())#, vmin=np.min(simulations), vmax=np.max(simulations))#, cmap="jet")
+                            if all_images.shape[1] == 2: # if the image has 2 channels, keep just the first one
+                                image = all_images[i, 0].squeeze()
+                            else:
+                                image = all_images[i].squeeze()
+                            im = ax.imshow(image.squeeze())#, vmin=np.min(simulations), vmax=np.max(simulations))#, cmap="jet")
                             ax.set_title(f"Alpha1={random_classes[i][0].item():.2f}, Alpha2={random_classes[i][1].item():.2f}")
                             plt.colorbar(im, ax=ax)
                             ax.axis('off')
