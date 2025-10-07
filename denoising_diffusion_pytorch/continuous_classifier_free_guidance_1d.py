@@ -147,9 +147,9 @@ class PreNorm(Module):
         self.fn = fn
         self.norm = RMSNorm(dim)
 
-    def forward(self, x):
+    def forward(self, x, *args, **kwargs):
         x = self.norm(x)
-        return self.fn(x)
+        return self.fn(x, *args, **kwargs)
 
 # sinusoidal positional embeds
 
@@ -286,6 +286,41 @@ class Attention(Module):
         out = rearrange(out, 'b h n d -> b (h d) n')
         return self.to_out(out)
 
+class CrossAttention(nn.Module):
+    def __init__(self, dim, context_dim, heads=4, dim_head=32):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        hidden_dim = dim_head * heads
+
+        self.to_q = nn.Conv1d(dim, hidden_dim, 1, bias=False)
+        self.to_k = nn.Linear(context_dim, hidden_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, hidden_dim, bias=False)
+        self.to_out = nn.Conv1d(hidden_dim, dim, 1)
+
+    def forward(self, x, context):
+        b, c, n = x.shape
+        # context shape: (B, seq_len, context_dim)
+        
+        q = self.to_q(x)  # (B, hidden_dim, n)
+        k = self.to_k(context)  # (B, seq_len, hidden_dim)
+        v = self.to_v(context)  # (B, seq_len, hidden_dim)
+        
+        # Rearrange for multi-head attention
+        q = rearrange(q, 'b (h d) n -> b h n d', h=self.heads)  # (B, heads, n, dim_head)
+        k = rearrange(k, 'b s (h d) -> b h s d', h=self.heads)  # (B, heads, seq_len, dim_head)
+        v = rearrange(v, 'b s (h d) -> b h s d', h=self.heads)  # (B, heads, seq_len, dim_head)
+
+        q = q * self.scale
+
+        # Attention: query positions attend to context sequence
+        sim = einsum('b h i d, b h j d -> b h i j', q, k)  # (B, heads, n, seq_len)
+        attn = sim.softmax(dim=-1)
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)  # (B, heads, n, dim_head)
+
+        out = rearrange(out, 'b h n d -> b (h d) n')
+        return self.to_out(out)
+
 # model
 
 class Unet1D(Module):
@@ -305,7 +340,9 @@ class Unet1D(Module):
         learned_sinusoidal_dim = 16,
         sinusoidal_pos_emb_theta = 10000,
         attn_dim_head = 32,
-        attn_heads = 4
+        attn_heads = 4,
+        full_attn=False,
+        cross_attn=False
     ):
         super().__init__()
 
@@ -349,8 +386,16 @@ class Unet1D(Module):
             nn.GELU(),
             nn.Linear(classes_dim, classes_dim)
         )
+        self.cross_attn = cross_attn
 
         resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, classes_emb_dim=classes_dim, dropout = dropout)
+        if cross_attn:
+            outter_attention = partial(CrossAttention, context_dim=classes_dim, dim_head=attn_dim_head, heads=attn_heads)
+        elif full_attn:
+            outter_attention = partial(Attention, dim_head=attn_dim_head, heads=attn_heads)
+        else:
+            outter_attention = partial(LinearAttention, dim_head=attn_dim_head, heads=attn_heads)
+
         # layers
 
         self.downs = ModuleList([])
@@ -363,7 +408,7 @@ class Unet1D(Module):
             self.downs.append(ModuleList([
                 resnet_block(dim_in, dim_in),
                 resnet_block(dim_in, dim_in),
-                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                Residual(PreNorm(dim_in, outter_attention(dim_in))),
                 Downsample(dim_in, dim_out) if not is_last else nn.Conv1d(dim_in, dim_out, 3, padding = 1)
             ]))
 
@@ -378,7 +423,7 @@ class Unet1D(Module):
             self.ups.append(ModuleList([
                 resnet_block(dim_out + dim_in, dim_out),
                 resnet_block(dim_out + dim_in, dim_out),
-                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                Residual(PreNorm(dim_out, outter_attention(dim_out))),
                 Upsample(dim_out, dim_in) if not is_last else  nn.Conv1d(dim_out, dim_in, 3, padding = 1)
             ]))
 
@@ -435,7 +480,6 @@ class Unet1D(Module):
                 null_classes_emb
             )
 
-
         c = self.classes_mlp(classes)
         x = self.init_conv(x)
         r = x.clone()
@@ -449,7 +493,10 @@ class Unet1D(Module):
             h.append(x)
 
             x = block2(x, t, c)
-            x = attn(x)
+            attention_args = {"x": x}
+            if self.cross_attn:
+                attention_args["context"] = c
+            x = attn(**attention_args)
             h.append(x)
 
             x = downsample(x)
@@ -470,7 +517,10 @@ class Unet1D(Module):
             x = maybe_pad(x, res_connection)
             x = torch.cat((x, res_connection), dim = 1)
             x = block2(x, t, c)
-            x = attn(x)
+            attention_args = {"x": x}
+            if self.cross_attn:
+                attention_args["context"] = c
+            x = attn(**attention_args)
 
             x = upsample(x)
 
@@ -763,6 +813,22 @@ class GaussianDiffusion1D(Module):
         x_start = None
 
         for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
+            img, x_start = self.p_sample(img, i, classes)
+
+        return img
+
+    @torch.no_grad()
+    def img_to_img(self, reference_input, classes, t=None):
+        b, *_, device = *reference_input.shape, reference_input.device
+        t = default(t, self.num_timesteps - 1)
+
+        t_batched = torch.full((b,), t, device = device)
+
+        # add noise to reference input
+        img = self.q_sample(reference_input, t=t_batched)
+
+        # denoise with the new class
+        for i in tqdm(reversed(range(0, t)), desc = 'img to img sample time step', total = t):
             img, x_start = self.p_sample(img, i, classes)
 
         return img
