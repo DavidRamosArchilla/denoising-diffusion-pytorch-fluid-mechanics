@@ -191,19 +191,21 @@ class Block(Module):
     def __init__(self, dim, dim_out, dropout = 0.):
         super().__init__()
         self.proj = nn.Conv1d(dim, dim_out, 3, padding = 1)
-        self.norm = RMSNorm(dim_out)
+        self.norm = RMSNorm(dim)
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, scale_shift = None):
-        x = self.proj(x)
         x = self.norm(x)
 
         if exists(scale_shift):
-            scale, shift = scale_shift
+            scale, shift, gate = scale_shift
             x = x * (scale + 1) + shift
 
+        x = self.proj(x)
         x = self.act(x)
+        if exists(scale_shift):
+            x = x * gate
         return self.dropout(x)
 
 class ResnetBlock(nn.Module):
@@ -211,24 +213,28 @@ class ResnetBlock(nn.Module):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim_out * 2)
+            nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim * 2 + dim_out)
+            # nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim_out * 2)
         ) if exists(time_emb_dim) or exists(classes_emb_dim) else None
-
+        self.dim_in = dim
+        self.dim_out = dim_out
         self.block1 = Block(dim, dim_out, dropout)
         self.block2 = Block(dim_out, dim_out, dropout)
         self.res_conv = nn.Conv1d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb = None, class_emb = None):
 
-        scale_shift = None
+        scale_shift_gate = None
         if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
             cond_emb = tuple(filter(exists, (time_emb, class_emb)))
             cond_emb = torch.cat(cond_emb, dim = -1)
             cond_emb = self.mlp(cond_emb)
             cond_emb = rearrange(cond_emb, 'b c -> b c 1')
-            scale_shift = cond_emb.chunk(2, dim = 1)
+            # scale_shift_gate = torch.split(cond_emb, [self.dim_out, self.dim_out], dim=1)
+            # scale_shift_gate = cond_emb.chunk(2, dim = 1)
+            scale_shift_gate = torch.split(cond_emb, [self.dim_in, self.dim_in, self.dim_out], dim=1)
 
-        h = self.block1(x, scale_shift = scale_shift)
+        h = self.block1(x, scale_shift = scale_shift_gate)
 
         h = self.block2(h)
         return h + self.res_conv(x)
@@ -567,7 +573,9 @@ class GaussianDiffusion1D(Module):
         ddim_sampling_eta = 0.,
         auto_normalize = True,
         channels = None,
-        channel_first = True
+        channel_first = True,
+        min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
+        min_snr_gamma = 5,
     ):
         super().__init__()
         self.model = model
@@ -634,18 +642,23 @@ class GaussianDiffusion1D(Module):
         register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
-        # calculate loss weight
+        # derive loss weight
+        # snr - signal noise ratio
 
         snr = alphas_cumprod / (1 - alphas_cumprod)
 
-        if objective == 'pred_noise':
-            loss_weight = torch.ones_like(snr)
-        elif objective == 'pred_x0':
-            loss_weight = snr
-        elif objective == 'pred_v':
-            loss_weight = snr / (snr + 1)
+        # https://arxiv.org/abs/2303.09556
 
-        register_buffer('loss_weight', loss_weight)
+        maybe_clipped_snr = snr.clone()
+        if min_snr_loss_weight:
+            maybe_clipped_snr.clamp_(max = min_snr_gamma)
+
+        if objective == 'pred_noise':
+            register_buffer('loss_weight', maybe_clipped_snr / snr)
+        elif objective == 'pred_x0':
+            register_buffer('loss_weight', maybe_clipped_snr)
+        elif objective == 'pred_v':
+            register_buffer('loss_weight', maybe_clipped_snr / (snr + 1))
 
         # whether to autonormalize
 
@@ -791,7 +804,7 @@ class GaussianDiffusion1D(Module):
         return img, noise
 
     @torch.no_grad()
-    def sample(self, classes, cond_scale = 6., rescaled_phi = 0.7, return_noise=False):
+    def sample(self, classes, cond_scale = 6., rescaled_phi = 0.7, return_noise=False, sampler=''):
         batch_size, channels = classes.shape[0], self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
 
