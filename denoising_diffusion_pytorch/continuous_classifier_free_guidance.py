@@ -3,6 +3,7 @@ from pathlib import Path
 from functools import partial
 from collections import namedtuple
 import warnings
+from random import random
 
 import numpy as np
 import torch
@@ -289,6 +290,7 @@ class Unet(nn.Module):
         cond_drop_prob = 0.5,
         init_dim = None,
         out_dim = None,
+        self_condition = False,
         dim_mults=(1, 2, 4, 8),
         channels = 3,
         learned_variance = False,
@@ -307,7 +309,8 @@ class Unet(nn.Module):
         # determine dimensions
 
         self.channels = channels
-        input_channels = channels
+        self.self_condition = self_condition
+        input_channels = channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding = 3)
@@ -396,7 +399,7 @@ class Unet(nn.Module):
         logits = self.forward(*args, cond_drop_prob = 0., **kwargs)
 
         if cond_scale == 1:
-            return logits
+            return logits, None
 
         null_logits = self.forward(*args, cond_drop_prob = 1., **kwargs)
         update = logits - null_logits
@@ -421,6 +424,7 @@ class Unet(nn.Module):
         x,
         time,
         classes,
+        x_self_cond = None,
         cond_drop_prob = None
     ):
         batch, device = x.shape[0], x.device
@@ -445,6 +449,9 @@ class Unet(nn.Module):
         c = self.classes_mlp(classes_emb)
 
         # unet
+        if self.self_condition:
+            x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
+            x = torch.cat((x_self_cond, x), dim = 1)
 
         x = self.init_conv(x)
         r = x.clone()
@@ -541,10 +548,12 @@ class GaussianDiffusion(nn.Module):
     ):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
-        assert not model.random_or_learned_sinusoidal_cond
+        # assert not model.random_or_learned_sinusoidal_cond
 
         self.model = model
         self.channels = self.model.channels
+        self.self_condition = self.model.self_condition
+
         self.cond_dim = self.model.cond_dim
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
@@ -671,8 +680,8 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, classes, cond_scale = 6., rescaled_phi = 0.7, clip_x_start = False):
-        model_output, model_output_null = self.model.forward_with_cond_scale(x, t, classes, cond_scale = cond_scale, rescaled_phi = rescaled_phi)
+    def model_predictions(self, x, t, classes, x_self_cond=None, cond_scale = 6., rescaled_phi = 0.7, clip_x_start = False):
+        model_output, model_output_null = self.model.forward_with_cond_scale(x, t, classes, x_self_cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -702,8 +711,8 @@ class GaussianDiffusion(nn.Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, classes, cond_scale, rescaled_phi, clip_denoised = True):
-        preds = self.model_predictions(x, t, classes, cond_scale, rescaled_phi)
+    def p_mean_variance(self, x, t, classes, cond_scale, rescaled_phi, x_self_cond=None, clip_denoised = True):
+        preds = self.model_predictions(x, t, classes, x_self_cond, cond_scale, rescaled_phi)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -713,10 +722,10 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, classes, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
+    def p_sample(self, x, t: int, classes, x_self_cond=None, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((x.shape[0],), t, device = x.device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, classes = classes, cond_scale = cond_scale, rescaled_phi = rescaled_phi, clip_denoised = clip_denoised)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, classes = classes, x_self_cond=x_self_cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi, clip_denoised = clip_denoised)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
@@ -730,14 +739,16 @@ class GaussianDiffusion(nn.Module):
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
-            img, x_start = self.p_sample(img, t, classes, cond_scale, rescaled_phi)
+            self_cond = x_start if self.self_condition else None
+            img, x_start = self.p_sample(img, t, classes, self_cond, cond_scale, rescaled_phi)
 
         img = unnormalize_to_zero_to_one(img)
         return img
 
     @torch.no_grad()
-    def ddim_sample(self, classes, shape, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
-        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+    def ddim_sample(self, classes, shape, cond_scale = 6., rescaled_phi = 0.7, num_inference_steps=None, clip_denoised = True):
+        num_inference_steps = default(num_inference_steps, self.sampling_timesteps)
+        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, num_inference_steps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
@@ -749,7 +760,8 @@ class GaussianDiffusion(nn.Module):
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, cond_scale = cond_scale, rescaled_phi = rescaled_phi, clip_x_start = clip_denoised)
+            self_cond = x_start if self.self_condition else None
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, self_cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi, clip_x_start = clip_denoised)
 
             if time_next < 0:
                 img = x_start
@@ -771,10 +783,37 @@ class GaussianDiffusion(nn.Module):
         return img
 
     @torch.no_grad()
-    def sample(self, classes, cond_scale = 6., rescaled_phi = 0.7):
+    def sample(self, classes, cond_scale=6., rescaled_phi=0.7, 
+           sampler='', num_inference_steps=None):
+        """
+        Sample from the diffusion model.
+        
+        Args:
+            classes: Class conditioning
+            cond_scale: Classifier-free guidance scale
+            rescaled_phi: Rescaling parameter
+            sampler: One of ['ddpm', 'ddim', 'dpm-solver++']
+            num_inference_steps: Number of steps (None uses defaults)
+        """
         batch_size, channels = classes.shape[0], self.channels
-        sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn(classes, (batch_size, channels, self.image_size[0], self.image_size[1]), cond_scale, rescaled_phi)
+        shape = (batch_size, channels, self.image_size[0], self.image_size[1])
+        if sampler == '':
+            sampler = "ddim" if self.is_ddim_sampling else "ddpm"
+
+        args = [classes, shape, cond_scale, rescaled_phi]
+        if num_inference_steps is not None:
+            args.append(num_inference_steps)
+
+        if sampler == 'ddpm':
+            return self.p_sample_loop(*args)
+        elif sampler == 'ddim':
+            # Use self.sampling_timesteps if num_inference_steps not specified
+            return self.ddim_sample(*args)
+        elif sampler == 'dpm-solver++':
+            raise NotImplementedError("This is not implemented yet")
+            # return self.dpm_solver_sample(*args)
+        else:
+            raise ValueError(f"Unknown sampler: {sampler}")
 
     @torch.no_grad()
     def interpolate(self, x1, x2, classes, t = None, lam = 0.5):
@@ -787,9 +826,10 @@ class GaussianDiffusion(nn.Module):
         xt1, xt2 = map(lambda x: self.q_sample(x, t = t_batched), (x1, x2))
 
         img = (1 - lam) * xt1 + lam * xt2
-
+        x_start = None
         for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
-            img, _ = self.p_sample(img, i, classes)
+            self_cond = x_start if self.self_condition else None
+            img, x_start = self.p_sample(img, i, classes, self_cond)
 
         return img
 
@@ -815,8 +855,13 @@ class GaussianDiffusion(nn.Module):
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
 
         # predict and take gradient step
+        x_self_cond = None
+        if self.self_condition and random() < 0.5:
+            with torch.no_grad():
+                x_self_cond = self.model_predictions(x, t, classes).pred_x_start
+                x_self_cond.detach_()
 
-        model_out = self.model(x, t, classes)
+        model_out = self.model(x, t, classes, x_self_cond)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -1119,7 +1164,7 @@ class Trainer:
         accelerator.print('training complete')
 
 
-def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_size, cond_scale=6, ):
+def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_size, cond_scale=6, sampler="ddpm"):
     if not isinstance(conditioning_variables, torch.Tensor):
         conditioning_variables = torch.tensor(conditioning_variables).float()
     if not isinstance(real_outputs, torch.Tensor):
@@ -1129,22 +1174,25 @@ def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_
     predictions = []
     for batch in batches:
         batch = batch.to(model_device)
-        predictions.append(model.sample(batch, cond_scale=cond_scale).cpu())
+        predictions.append(model.sample(batch, cond_scale=cond_scale, sampler=sampler).cpu())
 
     predictions = torch.cat(predictions, dim=0)
     nan_values = torch.isnan(predictions)
+    print("NaNs: ", nan_values.sum())
+    # predictions = predictions[~nan_values]
     print(predictions.shape)
-    predictions = predictions[~nan_values]
-    print(predictions.shape)
-    real_outputs = real_outputs[~nan_values]
-    mse = ((predictions - real_outputs) ** 2).mean()
-    mre = (torch.abs(predictions - real_outputs) / (real_outputs + 1e-5)).mean()
-    l2 = torch.linalg.norm(real_outputs - predictions) / torch.linalg.norm(real_outputs)
-    return {
-        "mse": mse,
-        "mre": mre,
-        "l2": l2
-    }, predictions
+    # real_outputs = real_outputs[~nan_values]
+    try:
+        mse = ((predictions - real_outputs) ** 2).mean()
+        mre = (torch.abs(predictions - real_outputs) / (real_outputs + 1e-5)).mean()
+        l2 = torch.linalg.norm(real_outputs - predictions) / torch.linalg.norm(real_outputs)
+        return {
+            "mse": mse,
+            "mre": mre,
+            "l2": l2
+        }, predictions
+    except:
+        return {}, predictions
 
 
 # example
