@@ -1,4 +1,4 @@
-# from torch_geometric.nn import GraphUNet
+from torch_geometric.nn import GraphUNet
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import knn_graph, radius_graph
 from typing import Callable, List, Union
@@ -14,7 +14,7 @@ from torch_geometric.utils import (
     remove_self_loops,
     to_torch_csr_tensor,
 )
-from torch_geometric.utils.repeat import repeat
+from torch_geometric.utils.repeat import repeat as repeat_geom
 
 import torch
 from torch import nn, autocast
@@ -166,11 +166,14 @@ class GraphBlock(nn.Module):
         ) if exists(time_emb_dim) or exists(classes_emb_dim) else None
         self.proj = GCNConv(dim, dim_out, improved=True)
         # self.norm = RMSNorm(dim_out)
+        print(dim, dim_out)
         self.act = nn.SiLU()
 
     def forward(self, x, edge_index, edge_weight, time_emb=None, class_emb=None):
         # x: (B*N_points, dim) --> (B*N_points, dim_out)
+        # print(x.shape)
         x = self.proj(x, edge_index, edge_weight)
+        # print(x.shape)
         # x = self.norm(x)
         if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
             cond_emb = tuple(filter(exists, (time_emb, class_emb)))
@@ -184,9 +187,7 @@ class GraphBlock(nn.Module):
             shift = repeat(shift, 'b c -> b c n', n = x.shape[0] // shift.shape[0])
             scale = rearrange(scale, 'b c n -> (b n) c')
             shift = rearrange(shift, 'b c n -> (b n) c')
-
             x = x * (scale + 1) + shift
-
         x = self.act(x)
         return x
 
@@ -207,6 +208,7 @@ class SinusoidalPosEmb(nn.Module):
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
 
 
 class ConditionedGraphUNet(torch.nn.Module):
@@ -223,7 +225,7 @@ class ConditionedGraphUNet(torch.nn.Module):
             depth. (default: :obj:`0.5`)
         sum_res (bool, optional): If set to :obj:`False`, will use
             concatenation for integration of skip connections instead
-            summation. (default: :obj:`True`)
+            summation. (default: :obj:`False`)
         act (torch.nn.functional, optional): The nonlinearity to use.
             (default: :obj:`torch.nn.functional.relu`)
     """
@@ -236,7 +238,7 @@ class ConditionedGraphUNet(torch.nn.Module):
         cond_drop_prob=0.0,
         dim_mults=(1, 2, 4, 8),
         pool_ratios: Union[float, List[float]] = 0.5,
-        sum_res: bool = True,
+        sum_res: bool = False,
         act: Union[str, Callable] = 'relu',
     ):
         super().__init__()
@@ -250,7 +252,7 @@ class ConditionedGraphUNet(torch.nn.Module):
 
         dims = [dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
-        self.pool_ratios = repeat(pool_ratios, len(in_out))
+        self.pool_ratios = repeat_geom(pool_ratios, len(in_out))
         self.act = activation_resolver(act)
         self.sum_res = sum_res
 
@@ -278,13 +280,12 @@ class ConditionedGraphUNet(torch.nn.Module):
             nn.Linear(classes_dim, classes_dim)
         )
 
-
         self.downs = nn.ModuleList([])
         self.pools = torch.nn.ModuleList()
         self.ups = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(in_out):
             # WARN: no estoy seguro de que aqui vaya dim_in
-            self.pools.append(TopKPooling(dim_in, self.pool_ratios[ind]))
+            self.pools.append(TopKPooling(dim_out, self.pool_ratios[ind]))
             self.downs.append(
                 GraphBlock(dim=dim_in, dim_out=dim_out, time_emb_dim=time_dim, classes_emb_dim=classes_dim),
                 # GraphBlock(dim=dim_in, dim_out=dim_out, time_emb_dim=time_dim, classes_emb_dim=classes_dim),
@@ -293,7 +294,7 @@ class ConditionedGraphUNet(torch.nn.Module):
         self.mid_block1 = GraphBlock(dim=dims[-1], dim_out=dims[-1], time_emb_dim=time_dim, classes_emb_dim=classes_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
-            in_channels = dim_out if sum_res else dim_in + dim_out
+            in_channels = dim_out if sum_res else 2 * dim_out # dim_in + dim_out # 2 * dim_out #
             self.ups.append(
                 GraphBlock(dim=in_channels, dim_out=dim_in, time_emb_dim=time_dim, classes_emb_dim=classes_dim),
             )
@@ -310,51 +311,75 @@ class ConditionedGraphUNet(torch.nn.Module):
         for block in self.ups:
             block.reset_parameters()
 
+
     def forward(self, x: Tensor, edge_index: Tensor,
-                batch: OptTensor = None) -> Tensor:
-        """"""  # noqa: D419
+                time, classes, cond_drop_prob=None, batch: OptTensor = None, ) -> Tensor:
+        # TODO: implement cfg
+        # if cond_drop_prob > 0:
+        #     pass
+
+        c = self.classes_mlp(classes)
+        t = self.time_mlp(time)
+
+
         if batch is None:
             batch = edge_index.new_zeros(x.size(0))
         edge_weight = x.new_ones(edge_index.size(1))
+        initial_edge_index = edge_index
+        initial_edge_weight = edge_weight
+        x = self.init_conv(x, edge_index, edge_weight)
+        # print("after init conv:", x.shape)
+        # r = x.clone()
+        # x = self.downs[0](x, edge_index, edge_weight)
+        # x = self.act(x)
 
-        x = self.down_convs[0](x, edge_index, edge_weight)
-        x = self.act(x)
-
-        xs = [x]
-        edge_indices = [edge_index]
-        edge_weights = [edge_weight]
+        # xs = [x]
+        # edge_indices = [edge_index]
+        # edge_weights = [edge_weight]
+        xs, edge_indices, edge_weights = [], [], []
         perms = []
 
-        for i in range(1, self.depth + 1):
-            edge_index, edge_weight = self.augment_adj(edge_index, edge_weight,
-                                                       x.size(0))
-            x, edge_index, edge_weight, batch, perm, _ = self.pools[i - 1](
-                x, edge_index, edge_weight, batch)
+        for i in range(len(self.downs)):
 
-            x = self.down_convs[i](x, edge_index, edge_weight)
+            x = self.downs[i](x, edge_index, edge_weight, time_emb=t, class_emb=c)
             x = self.act(x)
 
-            if i < self.depth:
-                xs += [x]
-                edge_indices += [edge_index]
-                edge_weights += [edge_weight]
+            # if i < len(self.downs) - 1:
+            xs += [x]
+            edge_indices += [edge_index]
+            edge_weights += [edge_weight]
+
+            edge_index, edge_weight = self.augment_adj(edge_index, edge_weight,
+                                                       x.size(0))
+            x, edge_index, edge_weight, batch, perm, _ = self.pools[i](
+                x, edge_index, edge_weight, batch)
             perms += [perm]
+        # print("downsampled x shape:", x.shape)
+        # for i in perms:
+        #     print("perm shape:", i.shape)
+        # for i in xs:
+        #     print("xs shape:", i.shape)
+        x = self.mid_block1(x, edge_index, edge_weight, time_emb=t, class_emb=c)
+        # print("downsampled x shape:", x.shape)
+        for i in range(len(self.ups)):
+            res = xs.pop()
+            edge_index = edge_indices.pop()
+            edge_weight = edge_weights.pop()
+            perm = perms.pop()
+            # print("res shape:", res.shape)
+            # print("perm shape:", perm.shape)
+            # print(x.shape)
 
-        for i in range(self.depth):
-            j = self.depth - 1 - i
-
-            res = xs[j]
-            edge_index = edge_indices[j]
-            edge_weight = edge_weights[j]
-            perm = perms[j]
-
+            # this is basically the inverse operation of pooling. Since the residual conection has more points, half of those points are populated with x where the permutation mask says (i'm not sure yet what is that perm variable)
             up = torch.zeros_like(res)
             up[perm] = x
             x = res + up if self.sum_res else torch.cat((res, up), dim=-1)
+            # print(x.shape)
+            x = self.ups[i](x, edge_index, edge_weight, time_emb=t, class_emb=c)
+            x = self.act(x) # if i < self.depth - 1 else x
+            # print(x.shape)
 
-            x = self.up_convs[i](x, edge_index, edge_weight)
-            x = self.act(x) if i < self.depth - 1 else x
-
+        x = self.out_conv(x, initial_edge_index, initial_edge_weight)
         return x
 
     def augment_adj(self, edge_index: Tensor, edge_weight: Tensor,
@@ -372,7 +397,7 @@ class ConditionedGraphUNet(torch.nn.Module):
     def __repr__(self) -> str:
         return (f'{self.__class__.__name__}({self.in_channels}, '
                 f'{self.hidden_channels}, {self.out_channels}, '
-                f'depth={self.depth}, pool_ratios={self.pool_ratios})')
+                f'depth={len(self.ups)}, pool_ratios={self.pool_ratios})')
 
 
 
@@ -843,7 +868,10 @@ def train(device, model, train_loader, optimizer):
         # out = model(data_clone.x, data_clone.edge_index)
         # print(data.x)
         # break
-        out = model(data_clone.x)
+        batch_size = data_clone.num_graphs
+        sample_classes = torch.randint(0, 2, (batch_size, model.cond_dim), device=device).float()
+        sample_timesteps = torch.randint(0, 1000, (batch_size,), device=device).float()
+        out = model(data_clone.x, data_clone.edge_index, sample_timesteps, sample_classes)
         targets = data_clone.y
         loss_criterion = nn.MSELoss(reduction = 'none')
         loss_per_var = loss_criterion(out, targets).mean(dim = 0)
@@ -871,24 +899,35 @@ if __name__ == '__main__':
     batch_size = 32
     target_field = 'Pressure'
     # Create dataset objects
-    train_dataset_obj = TransonicRAE(data_directory, target_field, num_points=None)#5000)
+    train_dataset_obj = TransonicRAE(data_directory, target_field, num_points=512)
     
     idx=100
     # Extract x and y from the dataset
     graph = train_dataset_obj.graph_dataset[idx]
     print(type(graph))
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # model = GraphUNet(
-    #     in_channels=4, out_channels=1, hidden_channels=64, depth=3
+    model = GraphUNet(
+        in_channels=4, out_channels=1, hidden_channels=64, depth=3
+    )
+    # import pyLOM.NN
+    # model = pyLOM.NN.MLP(
+    #     input_size=4, 
+    #     output_size=1,
+    #     hidden_size=128,
+    #     n_layers=4,
+    #     p_dropouts=0.,
+    #     # device='cpu'
     # )
-    import pyLOM.NN
-    model = pyLOM.NN.MLP(
-        input_size=4, 
-        output_size=1,
-        hidden_size=128,
-        n_layers=4,
-        p_dropouts=0.,
-        # device='cpu'
+    model = ConditionedGraphUNet(
+        dim=64,
+        in_channels=4,
+        out_channels=1,
+        cond_dim=2,
+        cond_drop_prob=0.0,
+        dim_mults=(1, 2, 4),
+        pool_ratios=0.5,
+        sum_res=False,
+        act='relu',
     )
     model = model.to(device)
     optimizer = AdamW(model.parameters(), lr=1e-4)
