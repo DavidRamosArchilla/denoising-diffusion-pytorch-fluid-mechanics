@@ -284,12 +284,11 @@ class ConditionedGraphUNet(torch.nn.Module):
         self.pools = torch.nn.ModuleList()
         self.ups = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(in_out):
-            # WARN: no estoy seguro de que aqui vaya dim_in
-            self.pools.append(TopKPooling(dim_out, self.pool_ratios[ind]))
             self.downs.append(
                 GraphBlock(dim=dim_in, dim_out=dim_out, time_emb_dim=time_dim, classes_emb_dim=classes_dim),
-                # GraphBlock(dim=dim_in, dim_out=dim_out, time_emb_dim=time_dim, classes_emb_dim=classes_dim),
             )
+            # pooling occurs after the GraphBlock
+            self.pools.append(TopKPooling(dim_out, self.pool_ratios[ind]))
 
         self.mid_block1 = GraphBlock(dim=dims[-1], dim_out=dims[-1], time_emb_dim=time_dim, classes_emb_dim=classes_dim)
 
@@ -328,14 +327,6 @@ class ConditionedGraphUNet(torch.nn.Module):
         initial_edge_index = edge_index
         initial_edge_weight = edge_weight
         x = self.init_conv(x, edge_index, edge_weight)
-        # print("after init conv:", x.shape)
-        # r = x.clone()
-        # x = self.downs[0](x, edge_index, edge_weight)
-        # x = self.act(x)
-
-        # xs = [x]
-        # edge_indices = [edge_index]
-        # edge_weights = [edge_weight]
         xs, edge_indices, edge_weights = [], [], []
         perms = []
 
@@ -344,40 +335,32 @@ class ConditionedGraphUNet(torch.nn.Module):
             x = self.downs[i](x, edge_index, edge_weight, time_emb=t, class_emb=c)
             x = self.act(x)
 
-            # if i < len(self.downs) - 1:
-            xs += [x]
-            edge_indices += [edge_index]
-            edge_weights += [edge_weight]
+            xs.append(x)
+            edge_indices.append(edge_index)
+            edge_weights.append(edge_weight)
 
             edge_index, edge_weight = self.augment_adj(edge_index, edge_weight,
                                                        x.size(0))
             x, edge_index, edge_weight, batch, perm, _ = self.pools[i](
                 x, edge_index, edge_weight, batch)
-            perms += [perm]
-        # print("downsampled x shape:", x.shape)
-        # for i in perms:
-        #     print("perm shape:", i.shape)
-        # for i in xs:
-        #     print("xs shape:", i.shape)
+            perms.append(perm)
+
         x = self.mid_block1(x, edge_index, edge_weight, time_emb=t, class_emb=c)
-        # print("downsampled x shape:", x.shape)
+
         for i in range(len(self.ups)):
             res = xs.pop()
             edge_index = edge_indices.pop()
             edge_weight = edge_weights.pop()
             perm = perms.pop()
-            # print("res shape:", res.shape)
-            # print("perm shape:", perm.shape)
-            # print(x.shape)
 
-            # this is basically the inverse operation of pooling. Since the residual conection has more points, half of those points are populated with x where the permutation mask says (i'm not sure yet what is that perm variable)
+            # this is basically the inverse operation of pooling. Since the residual conection has more points, half of
+            # those points are populated with x where the permutation mask says (i'm not sure yet what is that perm variable)
             up = torch.zeros_like(res)
             up[perm] = x
             x = res + up if self.sum_res else torch.cat((res, up), dim=-1)
-            # print(x.shape)
+
             x = self.ups[i](x, edge_index, edge_weight, time_emb=t, class_emb=c)
-            x = self.act(x) # if i < self.depth - 1 else x
-            # print(x.shape)
+            x = self.act(x)
 
         x = self.out_conv(x, initial_edge_index, initial_edge_weight)
         return x
@@ -393,12 +376,6 @@ class ConditionedGraphUNet(torch.nn.Module):
         edge_index, edge_weight = adj.indices(), adj.values()
         edge_index, edge_weight = remove_self_loops(edge_index, edge_weight)
         return edge_index, edge_weight
-
-    def __repr__(self) -> str:
-        return (f'{self.__class__.__name__}({self.in_channels}, '
-                f'{self.hidden_channels}, {self.out_channels}, '
-                f'depth={len(self.ups)}, pool_ratios={self.pool_ratios})')
-
 
 
 class GaussianDiffusion(nn.Module):
@@ -423,7 +400,7 @@ class GaussianDiffusion(nn.Module):
 
         self.model = model
         # self.num_features --> always 1?? (out_dim/in_dim)
-        self.self_condition = self.model.self_condition
+        # self.self_condition = self.model.self_condition
 
         self.cond_dim = self.model.cond_dim
         # if isinstance(image_size, int):
@@ -718,22 +695,21 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, *, classes, noise = None):
-        b, c, h, w = x_start.shape
+    def p_losses(self, x_start, edge_index, t, *, classes, noise = None):
+        # b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
-
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
 
         # predict and take gradient step
-        x_self_cond = None
-        if self.self_condition and random() < 0.5:
-            with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t, classes).pred_x_start
-                x_self_cond.detach_()
+        # x_self_cond = None
+        # if self.self_condition and random() < 0.5:
+        #     with torch.no_grad():
+        #         x_self_cond = self.model_predictions(x, t, classes).pred_x_start
+        #         x_self_cond.detach_()
 
-        model_out = self.model(x, t, classes, x_self_cond)
+        model_out = self.model(x, edge_index, t, classes)#, x_self_cond)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -751,13 +727,16 @@ class GaussianDiffusion(nn.Module):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
-    def forward(self, img, *args, **kwargs):
-        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
-        assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
+    def forward(self, data, *args, **kwargs):
+        x = data.x
+        edge_index = data.edge_index
+        device = x.device
+        b = data.num_graphs
+        # assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        img = normalize_to_neg_one_to_one(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        x = normalize_to_neg_one_to_one(x)
+        return self.p_losses(x, edge_index, t, *args, **kwargs)
 
 
 class TransonicRAE(Dataset):
@@ -884,7 +863,7 @@ def train(device, model, train_loader, optimizer):
         avg_loss += total_loss
 
         iter += 1
-        print(f"Iter {iter}, loss: {total_loss.item():.4f}", end='\r')
+        # print(f"Iter {iter}, loss: {total_loss.item():.4f}", end='\r')
     
     print(f"\nAvg loss: {avg_loss.item()/iter:.4f}")
 
@@ -896,10 +875,10 @@ if __name__ == '__main__':
     import matplotlib.pyplot as plt
     data_directory = 'data/aeronef/'
     save_directory = 'data/aeronef/'
-    batch_size = 32
+    batch_size = 16
     target_field = 'Pressure'
     # Create dataset objects
-    train_dataset_obj = TransonicRAE(data_directory, target_field, num_points=512)
+    train_dataset_obj = TransonicRAE(data_directory, target_field, num_points=10000)
     
     idx=100
     # Extract x and y from the dataset
@@ -918,6 +897,7 @@ if __name__ == '__main__':
     #     p_dropouts=0.,
     #     # device='cpu'
     # )
+    # TODO: es importante que cuando entrene modelo de difusion los datos esten en rango [0,1]
     model = ConditionedGraphUNet(
         dim=64,
         in_channels=4,
@@ -929,12 +909,14 @@ if __name__ == '__main__':
         sum_res=False,
         act='relu',
     )
+    print(model)
     model = model.to(device)
     optimizer = AdamW(model.parameters(), lr=1e-4)
     
     train_dataset_obj.create_splits(train_ratio=0.9, val_ratio=0.05, test_ratio=0.05, seed=42)
     train_loader = DataLoader(train_dataset_obj.train_dataset, batch_size=batch_size, shuffle=True)
-    for i in range(300):
+    for i in range(600):
+        print(f"Epoch {i+1}/300")
         train(device, model, train_loader, optimizer)
         # Inference and plotting
     model.eval()
@@ -944,7 +926,11 @@ if __name__ == '__main__':
         
         # Make prediction
         # prediction = model(test_sample.x, test_sample.edge_index)
-        prediction = model(test_sample.x)
+        # prediction = model(test_sample.x)
+        # batch_size = test_sample.num_graphs
+        sample_classes = torch.randint(0, 2, (1, model.cond_dim), device=device).float()
+        sample_timesteps = torch.randint(0, 1000, (1,), device=device).float()
+        prediction = model(test_sample.x, test_sample.edge_index, sample_timesteps, sample_classes)
         
         # Move to CPU and convert to numpy
         pred_np = prediction.cpu().numpy().squeeze()
