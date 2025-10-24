@@ -213,7 +213,8 @@ class ResnetBlock(nn.Module):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim * 2 + dim_out)
+            # (scale, shift, gate) for block1 (scale, shift, gate) for block2
+            nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim * 2 + dim_out * 4)
             # nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim_out * 2)
         ) if exists(time_emb_dim) or exists(classes_emb_dim) else None
         self.dim_in = dim
@@ -224,19 +225,19 @@ class ResnetBlock(nn.Module):
 
     def forward(self, x, time_emb = None, class_emb = None):
 
-        scale_shift_gate = None
+        # scale_shift_gate_block = None
         if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
             cond_emb = tuple(filter(exists, (time_emb, class_emb)))
             cond_emb = torch.cat(cond_emb, dim = -1)
             cond_emb = self.mlp(cond_emb)
             cond_emb = rearrange(cond_emb, 'b c -> b c 1')
             # scale_shift_gate = torch.split(cond_emb, [self.dim_out, self.dim_out], dim=1)
-            # scale_shift_gate = cond_emb.chunk(2, dim = 1)
-            scale_shift_gate = torch.split(cond_emb, [self.dim_in, self.dim_in, self.dim_out], dim=1)
+            # first_chunk, second_chunk = cond_emb.chunk(2, dim=1)
+            scale_shift_gate_block = torch.split(cond_emb, [self.dim_in, self.dim_in, self.dim_out, self.dim_out, self.dim_out, self.dim_out], dim=1)
 
-        h = self.block1(x, scale_shift = scale_shift_gate)
+        h = self.block1(x, scale_shift=scale_shift_gate_block[:3] if scale_shift_gate_block is not None else None)
 
-        h = self.block2(h)
+        h = self.block2(h, scale_shift=scale_shift_gate_block[3:] if scale_shift_gate_block is not None else None)
         return h + self.res_conv(x)
 
 class LinearAttention(Module):
