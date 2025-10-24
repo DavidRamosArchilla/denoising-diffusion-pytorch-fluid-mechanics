@@ -1,10 +1,7 @@
 from torch_geometric.nn import GraphUNet
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import knn_graph, radius_graph
-from typing import Callable, List, Union
-
-import torch
-from torch import Tensor
+from torch_geometric.utils.repeat import repeat as repeat_geom
 
 from torch_geometric.nn import GCNConv, TopKPooling
 from torch_geometric.nn.resolver import activation_resolver
@@ -14,14 +11,17 @@ from torch_geometric.utils import (
     remove_self_loops,
     to_torch_csr_tensor,
 )
-from torch_geometric.utils.repeat import repeat as repeat_geom
 
 import torch
-from torch import nn, autocast
 import torch.nn.functional as F
+from torch import nn, autocast
+from torch import Tensor
 from torch.utils.data import Dataset
 from torch.optim import AdamW
+
 import numpy as np
+
+from accelerate import Accelerator, DataLoaderConfiguration
 
 import os
 import math 
@@ -29,6 +29,8 @@ from pathlib import Path
 from functools import partial
 from random import random
 from collections import namedtuple
+from typing import Callable, List, Union
+import warnings
 
 from einops import rearrange, reduce, repeat, pack, unpack
 
@@ -155,6 +157,20 @@ def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
+
+
+def broadcast_for_graph_data(tensor, graph_data):
+    # shift = repeat(shift, 'b c -> b c n', n = x.shape[0] // shift.shape[0])
+    # scale = rearrange(scale, 'b c n -> (b n) c')
+    batch_size = tensor.shape[0]
+    num_points = graph_data.shape[0] // batch_size 
+    if len(tensor.shape) == 1:
+        tensor = repeat(tensor, 'b -> b n', n=num_points)
+        tensor = rearrange(tensor, 'b n -> (b n)')
+    else:
+        tensor = repeat(tensor, 'b 1 -> b n', n=num_points)
+        tensor = rearrange(tensor, 'b n -> (b n) 1')
+    return tensor
 
 
 class GraphBlock(nn.Module):
@@ -378,12 +394,13 @@ class ConditionedGraphUNet(torch.nn.Module):
         return edge_index, edge_weight
 
 
-class GaussianDiffusion(nn.Module):
+class GraphDiffusion(nn.Module):
     def __init__(
         self,
         model,
         *,
         num_mesh_points,
+        default_mesh_connectivity, # maybe a bit ugly, but for now it will make it work
         timesteps = 1000,
         sampling_timesteps = None,
         objective = 'pred_noise',
@@ -408,6 +425,7 @@ class GaussianDiffusion(nn.Module):
         # assert isinstance(image_size, (tuple, list)) and len(image_size) == 2, 'image size must be a integer or a tuple/list of two integers'
         # self.image_size = image_size
         self.num_mesh_points = num_mesh_points
+        self.default_mesh_connectivity = default_mesh_connectivity
 
         self.objective = objective
 
@@ -529,12 +547,14 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, classes, x_self_cond=None, cond_scale = 6., rescaled_phi = 0.7, clip_x_start = False):
-        model_output, model_output_null = self.model.forward_with_cond_scale(x, t, classes, x_self_cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi)
+    def model_predictions(self, x, t, classes, cond_scale = 6., rescaled_phi = 0.7, clip_x_start = False):
+        # TODO: implement cfg training. and if i feel like, cfg++ too
+        # model_output, model_output_null = self.model.forward_with_cond_scale(x, t, classes, x_self_cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi)
+        model_output = self.model(x, self.default_mesh_connectivity, t, classes)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
-            pred_noise = model_output if not self.use_cfg_plus_plus else model_output_null
+            pred_noise = model_output # if not self.use_cfg_plus_plus else model_output_null
 
             x_start = self.predict_start_from_noise(x, t, model_output)
             x_start = maybe_clip(x_start)
@@ -542,7 +562,7 @@ class GaussianDiffusion(nn.Module):
         elif self.objective == 'pred_x0':
             x_start = model_output
             x_start = maybe_clip(x_start)
-            x_start_for_pred_noise = x_start if not self.use_cfg_plus_plus else maybe_clip(model_output_null)
+            x_start_for_pred_noise = x_start # if not self.use_cfg_plus_plus else maybe_clip(model_output_null)
 
             pred_noise = self.predict_noise_from_start(x, t, x_start_for_pred_noise)
 
@@ -552,16 +572,16 @@ class GaussianDiffusion(nn.Module):
             x_start = maybe_clip(x_start)
 
             x_start_for_pred_noise = x_start
-            if self.use_cfg_plus_plus:
-                x_start_for_pred_noise = self.predict_start_from_v(x, t, model_output_null)
-                x_start_for_pred_noise = maybe_clip(x_start_for_pred_noise)
+            # if self.use_cfg_plus_plus:
+            #     x_start_for_pred_noise = self.predict_start_from_v(x, t, model_output_null)
+            #     x_start_for_pred_noise = maybe_clip(x_start_for_pred_noise)
 
             pred_noise = self.predict_noise_from_start(x, t, x_start_for_pred_noise)
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, classes, cond_scale, rescaled_phi, x_self_cond=None, clip_denoised = True):
-        preds = self.model_predictions(x, t, classes, x_self_cond, cond_scale, rescaled_phi)
+    def p_mean_variance(self, x, t, classes, cond_scale, rescaled_phi, clip_denoised = True):
+        preds = self.model_predictions(x, t, classes, cond_scale, rescaled_phi)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -571,25 +591,32 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, classes, x_self_cond=None, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
-        # b, *_, device = *x.shape, x.device
-        batched_times = torch.full((x.shape[0],), t, device = x.device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, classes = classes, x_self_cond=x_self_cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi, clip_denoised = clip_denoised)
+    def p_sample(self, x, t: int, classes, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
+        batch_size = classes.shape[0]
+        batched_times = torch.full((batch_size,), t, device = x.device, dtype = torch.long)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(
+            x=x,
+            t=batched_times,
+            classes=classes,
+            cond_scale=cond_scale,
+            rescaled_phi=rescaled_phi,
+            clip_denoised=clip_denoised,
+        )
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.no_grad()
     def p_sample_loop(self, classes, shape, cond_scale = 6., rescaled_phi = 0.7):
-        batch, device = shape[0], self.betas.device
+        device = self.betas.device
 
         img = torch.randn(shape, device=device)
 
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
-            self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, classes, self_cond, cond_scale, rescaled_phi)
+            # self_cond = x_start if self.self_condition else None
+            img, x_start = self.p_sample(img, t, classes, cond_scale, rescaled_phi)
 
         img = unnormalize_to_zero_to_one(img)
         return img
@@ -597,7 +624,7 @@ class GaussianDiffusion(nn.Module):
     @torch.no_grad()
     def ddim_sample(self, classes, shape, cond_scale = 6., rescaled_phi = 0.7, num_inference_steps=None, clip_denoised = True):
         num_inference_steps = default(num_inference_steps, self.sampling_timesteps)
-        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, num_inference_steps, self.ddim_sampling_eta, self.objective
+        batch, device, total_timesteps, sampling_timesteps, eta = classes.shape[0], self.betas.device, self.num_timesteps, num_inference_steps, self.ddim_sampling_eta
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
@@ -609,8 +636,8 @@ class GaussianDiffusion(nn.Module):
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, self_cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi, clip_x_start = clip_denoised)
+            # self_cond = x_start if self.self_condition else None
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, cond_scale = cond_scale, rescaled_phi = rescaled_phi, clip_x_start = clip_denoised)
 
             if time_next < 0:
                 img = x_start
@@ -644,8 +671,10 @@ class GaussianDiffusion(nn.Module):
             sampler: One of ['ddpm', 'ddim', 'dpm-solver++']
             num_inference_steps: Number of steps (None uses defaults)
         """
-        batch_size, channels = classes.shape[0], self.channels
-        shape = (batch_size, channels, self.image_size[0], self.image_size[1])
+        batch_size = classes.shape[0]
+        num_mesh_points = self.num_mesh_points
+        # shape = (batch_size, channels, self.image_size[0], self.image_size[1])
+        shape = (batch_size * num_mesh_points, self.model.in_channels)
         if sampler == '':
             sampler = "ddim" if self.is_ddim_sampling else "ddpm"
 
@@ -686,13 +715,18 @@ class GaussianDiffusion(nn.Module):
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
-        if self.offset_noise_strength > 0.:
-            offset_noise = torch.randn(x_start.shape[:2], device = self.device)
-            noise += self.offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
-
+        # by default this was 0, the rearrange would need to be modified for graphunet
+        # if self.offset_noise_strength > 0.:
+        #     offset_noise = torch.randn(x_start.shape[:2], device = self.device)
+        #     noise += self.offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
+        # print(broadcast_for_graph_data(extract(self.sqrt_alphas_cumprod, t, x_start.shape), x_start).shape)
+        # aqui falla, puede ser buena idea implementarme una funcion para hacer yo el 
+        # broradcasting ya que al usar datos de grafos esto no puede pasar de manera automatica
+        # shift = repeat(shift, 'b c -> b c n', n = x.shape[0] // shift.shape[0])
+        # scale = rearrange(scale, 'b c n -> (b n) c')
         return (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+            broadcast_for_graph_data(extract(self.sqrt_alphas_cumprod, t, x_start.shape), x_start) * x_start +
+            broadcast_for_graph_data(extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape), x_start) * noise
         )
 
     def p_losses(self, x_start, edge_index, t, *, classes, noise = None):
@@ -724,7 +758,7 @@ class GaussianDiffusion(nn.Module):
         loss = F.mse_loss(model_out, target, reduction = 'none')
         loss = reduce(loss, 'b ... -> b', 'mean')
 
-        loss = loss * extract(self.loss_weight, t, loss.shape)
+        loss = loss * broadcast_for_graph_data(extract(self.loss_weight, t, loss.shape), loss)
         return loss.mean()
 
     def forward(self, data, *args, **kwargs):
@@ -737,6 +771,217 @@ class GaussianDiffusion(nn.Module):
 
         x = normalize_to_neg_one_to_one(x)
         return self.p_losses(x, edge_index, t, *args, **kwargs)
+
+
+class Trainer:
+    def __init__(
+        self,
+        diffusion_model,
+        *,
+        dataset=None,
+        train_batch_size=16,
+        gradient_accumulate_every=1,
+        train_lr=1e-4,
+        train_num_steps=100000,
+        ema_update_every=10,
+        ema_decay=0.995,
+        adam_betas=(0.9, 0.99),
+        save_and_sample_every=1000,
+        num_samples=25,
+        results_folder="./results",
+        amp=False,
+        mixed_precision_type="fp16",
+        split_batches=True,
+        max_grad_norm=1.0,
+        save_best_and_latest_only=False,
+        use_cpu=False,
+    ):
+        super().__init__()
+
+        # accelerator
+        self.accelerator = Accelerator(
+            mixed_precision=mixed_precision_type if amp else 'no',
+            cpu=use_cpu,
+            dataloader_config=DataLoaderConfiguration(split_batches=split_batches)
+        )
+
+        # model
+        self.model = diffusion_model
+
+        # sampling and training hyperparameters
+        assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
+        self.num_samples = num_samples
+        self.save_and_sample_every = save_and_sample_every
+
+        self.batch_size = train_batch_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+        # assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
+
+        if (train_batch_size * gradient_accumulate_every) < 16:
+            warnings.warn(f"WARNING: Your effective batch size (train_batch_size x gradient_accumulate_every) is {train_batch_size * gradient_accumulate_every}, which is less than 16. It is recommended to use at least 16 or above.")
+
+        self.train_num_steps = train_num_steps
+
+        self.max_grad_norm = max_grad_norm
+
+        # dataset and dataloader
+        self.ds = dataset
+
+        # this is the dataloader from torch geometric
+        dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=4)
+
+        dl = self.accelerator.prepare(dl)
+        self.dl = cycle(dl)
+
+        # optimizer
+
+        self.opt = AdamW(diffusion_model.parameters(), lr = train_lr, betas = adam_betas, weight_decay=1e-4)
+
+        # for logging results in a folder periodically
+
+        if self.accelerator.is_main_process:
+            self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
+            self.ema.to(self.device)
+
+        self.results_folder = Path(results_folder)
+        self.results_folder.mkdir(exist_ok=True)
+
+        # step counter state
+        self.step = 0
+
+        # prepare model, dataloader, optimizer with accelerator
+        self.cond_dim = diffusion_model.cond_dim
+        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+
+        self.save_best_and_latest_only = save_best_and_latest_only
+        self.all_losses = []
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    def save(self, milestone):
+        if not self.accelerator.is_local_main_process:
+            return
+
+        data = {
+            'step': self.step,
+            'model': self.accelerator.get_state_dict(self.model),
+            'opt': self.opt.state_dict(),
+            'ema': self.ema.state_dict(),
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+            'loss_history': torch.tensor(self.all_losses)
+        }
+
+        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+
+    def load(self, milestone):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device, weights_only=True)
+
+        model = self.accelerator.unwrap_model(self.model)
+        model.load_state_dict(data['model'])
+
+        self.step = data['step']
+        self.opt.load_state_dict(data['opt'])
+        if self.accelerator.is_main_process:
+            self.ema.load_state_dict(data["ema"])
+
+        if 'version' in data:
+            print(f"loading from version {data['version']}")
+
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
+        
+        if exists(data['loss_history']):
+            self.all_losses = data['loss_history'].tolist()
+
+    def train(self):
+        accelerator = self.accelerator
+        device = accelerator.device
+        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+
+            while self.step < self.train_num_steps:
+                self.model.train()
+
+                total_loss = 0.
+
+                for _ in range(self.gradient_accumulate_every):
+                    data = next(self.dl)#.to(device)
+                    graphs, classes = data[0].to(device), data[1].to(device)
+                    # print(f'Graph batch num graphs: {graphs.num_graphs},', graphs.x.shape, classes.shape)
+                    with self.accelerator.autocast():
+                        loss = self.model(graphs, classes=classes)
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.item()
+
+                    self.accelerator.backward(loss)
+
+                accelerator.wait_for_everyone()
+                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                self.opt.step()
+                self.opt.zero_grad()
+
+                accelerator.wait_for_everyone()
+
+                self.step += 1
+                if accelerator.is_main_process:
+                    self.all_losses.append(total_loss)
+                    pbar.set_description(f'loss: {total_loss:.4f}')
+                    pbar.update(1)
+                    self.ema.update()
+
+                    if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
+                        self.ema.ema_model.eval()
+
+                        with torch.inference_mode():
+                            milestone = self.step // self.save_and_sample_every
+                            random_classes = torch.rand((self.num_samples, self.cond_dim), device=device)
+                            batches = torch.split(random_classes, self.batch_size)
+                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(classes=n), batches))
+
+                        all_images = torch.cat(all_images_list, dim = 0).cpu()
+                        accelerator.print(all_images.shape)
+
+                        # utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+                        # grid = utils.make_grid(all_images, nrow=int(math.sqrt(self.num_samples)))
+                        fig, axes = plt.subplots(3, 3, figsize=(12,12))
+
+                        for i, ax in enumerate(axes.flat):
+                            if all_images.shape[1] == 2: # if the image has 2 channels, keep just the first one
+                                image = all_images[i, 0].squeeze()
+                            else:
+                                image = all_images[i].squeeze()
+                            im = ax.imshow(image.squeeze())#, vmin=np.min(simulations), vmax=np.max(simulations))#, cmap="jet")
+                            ax.set_title(f"Alpha1={random_classes[i][0].item():.2f}, Alpha2={random_classes[i][1].item():.2f}")
+                            plt.colorbar(im, ax=ax)
+                            ax.axis('off')
+                        plt.savefig(self.results_folder / f"colored_grid{milestone}.png", bbox_inches="tight", pad_inches=0)
+                        plt.close()
+
+                        self.save(milestone)
+                        milestone = self.step // self.save_and_sample_every
+                        self.save(milestone)
+                
+        if accelerator.is_main_process:
+            plt.figure()
+            plt.plot(self.all_losses, label='Loss')
+            # Compute moving average
+            window_size = 100
+            if len(self.all_losses) >= window_size:
+                moving_avg = np.convolve(self.all_losses, np.ones(window_size)/window_size, mode='valid')
+                plt.plot(range(window_size-1, len(self.all_losses)), moving_avg, label=f'Moving Avg ({window_size})')
+            plt.yscale('log')
+            plt.xlabel('Training Steps')
+            plt.ylabel('Loss (log scale)')
+            plt.title('Training Loss Evolution')
+            plt.legend()
+            plt.savefig(self.results_folder / "loss_evolution.png", bbox_inches="tight", pad_inches=0)
+            plt.close()
+        accelerator.print('training complete')
 
 
 class TransonicRAE(Dataset):
