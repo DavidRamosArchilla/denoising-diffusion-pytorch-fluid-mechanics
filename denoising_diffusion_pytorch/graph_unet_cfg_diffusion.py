@@ -250,7 +250,7 @@ class ConditionedGraphUNet(torch.nn.Module):
         dim: int,
         in_channels: int,
         out_channels: int,
-        cond_dim: int,
+        cond_dim: int = None,
         cond_drop_prob=0.0,
         dim_mults=(1, 2, 4, 8),
         pool_ratios: Union[float, List[float]] = 0.5,
@@ -273,28 +273,30 @@ class ConditionedGraphUNet(torch.nn.Module):
         self.sum_res = sum_res
 
         self.channels = in_channels
-
-        time_dim = dim * 4
-        sinu_pos_emb = SinusoidalPosEmb(dim)
-
-        # time embeddings
-        self.time_mlp = nn.Sequential(
-            sinu_pos_emb,
-            nn.Linear(dim, time_dim),
-            nn.GELU(),
-            nn.Linear(time_dim, time_dim)
-        )
-        # class embeddings
         self.cond_dim = cond_dim
-        self.null_classes_emb = nn.Parameter(torch.randn(cond_dim))
+        if cond_dim is not None: 
+            time_dim = dim * 4
+            sinu_pos_emb = SinusoidalPosEmb(dim)
 
-        classes_dim = dim * 4
+            # time embeddings
+            self.time_mlp = nn.Sequential(
+                sinu_pos_emb,
+                nn.Linear(dim, time_dim),
+                nn.GELU(),
+                nn.Linear(time_dim, time_dim)
+            )
+            # class embeddings
+            self.null_classes_emb = nn.Parameter(torch.randn(cond_dim))
 
-        self.classes_mlp = nn.Sequential(
-            nn.Linear(cond_dim, classes_dim),
-            nn.GELU(),
-            nn.Linear(classes_dim, classes_dim)
-        )
+            classes_dim = dim * 4
+
+            self.classes_mlp = nn.Sequential(
+                nn.Linear(cond_dim, classes_dim),
+                nn.GELU(),
+                nn.Linear(classes_dim, classes_dim)
+            )
+        else:
+            time_dim, classes_dim = None, None
 
         self.downs = nn.ModuleList([])
         self.pools = torch.nn.ModuleList()
@@ -328,14 +330,16 @@ class ConditionedGraphUNet(torch.nn.Module):
 
 
     def forward(self, x: Tensor, edge_index: Tensor,
-                time, classes, cond_drop_prob=None, batch: OptTensor = None, ) -> Tensor:
+                time=None, classes=None, cond_drop_prob=None, batch: OptTensor = None, ) -> Tensor:
         # TODO: implement cfg
         # if cond_drop_prob > 0:
         #     pass
-
-        c = self.classes_mlp(classes)
-        t = self.time_mlp(time)
-
+        conditioning_args = {}
+        if self.cond_dim is not None:
+            c = self.classes_mlp(classes)
+            t = self.time_mlp(time)
+            conditioning_args["time_emb"] = t
+            conditioning_args["class_emb"] = c
 
         if batch is None:
             batch = edge_index.new_zeros(x.size(0))
@@ -348,7 +352,7 @@ class ConditionedGraphUNet(torch.nn.Module):
 
         for i in range(len(self.downs)):
 
-            x = self.downs[i](x, edge_index, edge_weight, time_emb=t, class_emb=c)
+            x = self.downs[i](x, edge_index, edge_weight, **conditioning_args)
             x = self.act(x)
 
             xs.append(x)
@@ -361,7 +365,7 @@ class ConditionedGraphUNet(torch.nn.Module):
                 x, edge_index, edge_weight, batch)
             perms.append(perm)
 
-        x = self.mid_block1(x, edge_index, edge_weight, time_emb=t, class_emb=c)
+        x = self.mid_block1(x, edge_index, edge_weight, **conditioning_args)
 
         for i in range(len(self.ups)):
             res = xs.pop()
@@ -375,7 +379,7 @@ class ConditionedGraphUNet(torch.nn.Module):
             up[perm] = x
             x = res + up if self.sum_res else torch.cat((res, up), dim=-1)
 
-            x = self.ups[i](x, edge_index, edge_weight, time_emb=t, class_emb=c)
+            x = self.ups[i](x, edge_index, edge_weight, **conditioning_args)
             x = self.act(x)
 
         x = self.out_conv(x, initial_edge_index, initial_edge_weight)
