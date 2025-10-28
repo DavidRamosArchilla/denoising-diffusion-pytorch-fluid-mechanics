@@ -159,18 +159,18 @@ def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1
     return torch.clip(betas, 0, 0.999)
 
 
-def broadcast_for_graph_data(tensor, graph_data):
-    # shift = repeat(shift, 'b c -> b c n', n = x.shape[0] // shift.shape[0])
-    # scale = rearrange(scale, 'b c n -> (b n) c')
-    batch_size = tensor.shape[0]
-    num_points = graph_data.shape[0] // batch_size 
-    if len(tensor.shape) == 1:
-        tensor = repeat(tensor, 'b -> b n', n=num_points)
-        tensor = rearrange(tensor, 'b n -> (b n)')
-    else:
-        tensor = repeat(tensor, 'b 1 -> b n', n=num_points)
-        tensor = rearrange(tensor, 'b n -> (b n) 1')
-    return tensor
+# def broadcast_for_graph_data(tensor, graph_data):
+#     # shift = repeat(shift, 'b c -> b c n', n = x.shape[0] // shift.shape[0])
+#     # scale = rearrange(scale, 'b c n -> (b n) c')
+#     batch_size = tensor.shape[0]
+#     num_points = graph_data.shape[0] // batch_size 
+#     if len(tensor.shape) == 1:
+#         tensor = repeat(tensor, 'b -> b n', n=num_points)
+#         tensor = rearrange(tensor, 'b n -> (b n)')
+#     else:
+#         tensor = repeat(tensor, 'b 1 -> b n', n=num_points)
+#         tensor = rearrange(tensor, 'b n -> (b n) 1')
+#     return tensor
 
 
 class GraphBlock(nn.Module):
@@ -181,30 +181,37 @@ class GraphBlock(nn.Module):
             nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim_out * 2)
         ) if exists(time_emb_dim) or exists(classes_emb_dim) else None
         self.proj = GCNConv(dim, dim_out, improved=True)
-        # self.norm = RMSNorm(dim_out)
+        self.norm = RMSNorm(dim)
         print(dim, dim_out)
         self.act = nn.SiLU()
 
     def forward(self, x, edge_index, edge_weight, time_emb=None, class_emb=None):
         # x: (B*N_points, dim) --> (B*N_points, dim_out)
-        # print(x.shape)
+        # print("x shape forward block", x.shape)
+        batch_size = x.shape[0]
+        x = self.norm(x)
+        x = rearrange(x, 'b c n -> (b n) c')
         x = self.proj(x, edge_index, edge_weight)
+        x = rearrange(x, '(b n) c -> b c n', b=batch_size)
         # print(x.shape)
-        # x = self.norm(x)
         if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
             cond_emb = tuple(filter(exists, (time_emb, class_emb)))
             cond_emb = torch.cat(cond_emb, dim = -1)
+            # print("cond_emb", cond_emb.shape)
             # (B, time_emb_dim + classes_emb_dim) --> (B, dim_out * 2)
             cond_emb = self.mlp(cond_emb)
+            cond_emb = rearrange(cond_emb, 'b c -> b c 1')
+            # print("cond_emb", cond_emb.shape)
             scale_shift = cond_emb.chunk(2, dim = 1)
             # (B, dim_out), (B, dim_out) --> (B*N_points, dim_out), (B*N_points, dim_out)
             scale, shift = scale_shift
-            scale = repeat(scale, 'b c -> b c n', n = x.shape[0] // scale.shape[0])
-            shift = repeat(shift, 'b c -> b c n', n = x.shape[0] // shift.shape[0])
-            scale = rearrange(scale, 'b c n -> (b n) c')
-            shift = rearrange(shift, 'b c n -> (b n) c')
+            # scale = repeat(scale, 'b c -> b c n', n = x.shape[0] // scale.shape[0])
+            # shift = repeat(shift, 'b c -> b c n', n = x.shape[0] // shift.shape[0])
+            # scale = rearrange(scale, 'b c n -> (b n) c')
+            # shift = rearrange(shift, 'b c n -> (b n) c')
             x = x * (scale + 1) + shift
         x = self.act(x)
+        
         return x
 
     def reset_parameters(self):
@@ -225,6 +232,15 @@ class SinusoidalPosEmb(nn.Module):
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.g = nn.Parameter(torch.ones(1, dim, 1))
+
+    def forward(self, x):
+        return F.normalize(x, dim = 1) * self.g * (x.shape[1] ** 0.5)
 
 
 class ConditionedGraphUNet(torch.nn.Module):
@@ -340,29 +356,40 @@ class ConditionedGraphUNet(torch.nn.Module):
             t = self.time_mlp(time)
             conditioning_args["time_emb"] = t
             conditioning_args["class_emb"] = c
-
+        batch_size = x.shape[0]
+        num_nodes = x.shape[2]
         if batch is None:
-            batch = edge_index.new_zeros(x.size(0))
+            # batch = edge_index.new_zeros(x.size(0))
+            batch = torch.arange(batch_size, device=x.device).repeat_interleave(num_nodes)
         edge_weight = x.new_ones(edge_index.size(1))
         initial_edge_index = edge_index
         initial_edge_weight = edge_weight
+
+        batch_size = x.shape[0]
+        x = rearrange(x, 'b c n -> (b n) c')
         x = self.init_conv(x, edge_index, edge_weight)
+        x = rearrange(x, '(b n) c -> b c n', b=batch_size)
         xs, edge_indices, edge_weights = [], [], []
         perms = []
 
         for i in range(len(self.downs)):
-
+            # X: (B, C_in, N) --> (B, C_out, N)
+            # print(f"block {i} x shape", x.shape)
             x = self.downs[i](x, edge_index, edge_weight, **conditioning_args)
-            x = self.act(x)
+            # x = self.act(x)
 
             xs.append(x)
             edge_indices.append(edge_index)
             edge_weights.append(edge_weight)
-
+            # print(f"block {i} x shape", x.shape, edge_index.shape)
+            x = rearrange(x, 'b c n -> (b n) c')
             edge_index, edge_weight = self.augment_adj(edge_index, edge_weight,
-                                                       x.size(0))
+                                                       x.size(0)) #  * x.size(2)
+            # print(f"block {i} x shape", x.shape, edge_index.shape)
             x, edge_index, edge_weight, batch, perm, _ = self.pools[i](
                 x, edge_index, edge_weight, batch)
+            x = rearrange(x, '(b n) c -> b c n', b=batch_size)
+            # print(f"block {i} x shape", x.shape, edge_index.shape)
             perms.append(perm)
 
         x = self.mid_block1(x, edge_index, edge_weight, **conditioning_args)
@@ -375,14 +402,20 @@ class ConditionedGraphUNet(torch.nn.Module):
 
             # this is basically the inverse operation of pooling. Since the residual conection has more points, half of
             # those points are populated with x where the permutation mask says (i'm not sure yet what is that perm variable)
+            x = rearrange(x, 'b c n -> (b n) c')
+            res = rearrange(res, 'b c n -> (b n) c')
+            # print(x.shape, res.shape, perm.shape)
             up = torch.zeros_like(res)
             up[perm] = x
             x = res + up if self.sum_res else torch.cat((res, up), dim=-1)
 
+            x = rearrange(x, '(b n) c -> b c n', b=batch_size)
             x = self.ups[i](x, edge_index, edge_weight, **conditioning_args)
-            x = self.act(x)
+            # x = self.act(x)
 
+        x = rearrange(x, 'b c n -> (b n) c')
         x = self.out_conv(x, initial_edge_index, initial_edge_weight)
+        x = rearrange(x, '(b n) c -> b c n', b=batch_size)
         return x
 
     def augment_adj(self, edge_index: Tensor, edge_weight: Tensor,
@@ -554,7 +587,10 @@ class GraphDiffusion(nn.Module):
     def model_predictions(self, x, t, classes, cond_scale = 6., rescaled_phi = 0.7, clip_x_start = False):
         # TODO: implement cfg training. and if i feel like, cfg++ too
         # model_output, model_output_null = self.model.forward_with_cond_scale(x, t, classes, x_self_cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi)
+        # x = rearrange(x, 'b c n -> (b n) c')
         model_output = self.model(x, self.default_mesh_connectivity, t, classes)
+        # batch_size = t.shape[0]
+        # model_output = rearrange(model_output, '(b n) c -> b c n', b=batch_size)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -729,8 +765,8 @@ class GraphDiffusion(nn.Module):
         # shift = repeat(shift, 'b c -> b c n', n = x.shape[0] // shift.shape[0])
         # scale = rearrange(scale, 'b c n -> (b n) c')
         return (
-            broadcast_for_graph_data(extract(self.sqrt_alphas_cumprod, t, x_start.shape), x_start) * x_start +
-            broadcast_for_graph_data(extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape), x_start) * noise
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
     def p_losses(self, x_start, edge_index, t, *, classes, noise = None):
@@ -746,8 +782,10 @@ class GraphDiffusion(nn.Module):
         #     with torch.no_grad():
         #         x_self_cond = self.model_predictions(x, t, classes).pred_x_start
         #         x_self_cond.detach_()
-
+        # x = rearrange(x, 'b c n -> (b n) c')
         model_out = self.model(x, edge_index, t, classes)#, x_self_cond)
+        # batch_size = t.shape[0]
+        # model_out = rearrange(model_out, '(b n) c -> b c n', b=batch_size)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -762,7 +800,7 @@ class GraphDiffusion(nn.Module):
         loss = F.mse_loss(model_out, target, reduction = 'none')
         loss = reduce(loss, 'b ... -> b', 'mean')
 
-        loss = loss * broadcast_for_graph_data(extract(self.loss_weight, t, loss.shape), loss)
+        loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
     def forward(self, data, *args, **kwargs):
@@ -772,8 +810,10 @@ class GraphDiffusion(nn.Module):
         b = data.num_graphs
         # assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-
+        x = rearrange(x, '(b n) c -> b c n', b=b)
+        # print(x.min(), x.max())
         x = normalize_to_neg_one_to_one(x)
+        # print(x.min(), x.max())
         return self.p_losses(x, edge_index, t, *args, **kwargs)
 
 
@@ -1003,10 +1043,10 @@ class TransonicRAE(Dataset):
 
         print('Loading raw data')
         db_random = np.load(os.path.join(data_directory, 'db_random.npy'), allow_pickle=True).item()
-        db_cyc = np.load(os.path.join(data_directory, 'db_cyc.npy'), allow_pickle=True).item()
-        
+        # db_cyc = np.load(os.path.join(data_directory, 'db_cyc.npy'), allow_pickle=True).item()
+        db = db_random 
         # Merge db_random and db_cyc
-        db = {key: np.concatenate((db_random[key], db_cyc[key]), axis=0) for key in ['Pressure','Xcoordinate','Ycoordinate','Vinf','Alpha','idx']}
+        # db = {key: np.concatenate((db_random[key], db_cyc[key]), axis=0) for key in ['Pressure','Xcoordinate','Ycoordinate','Vinf','Alpha','idx']}
         print('Raw data Loaded, normalizing data')
     
 
@@ -1096,10 +1136,13 @@ def train(device, model, train_loader, optimizer):
         # out = model(data_clone.x, data_clone.edge_index)
         # print(data.x)
         # break
-        batch_size = data_clone.num_graphs
-        sample_classes = torch.randint(0, 2, (batch_size, model.cond_dim), device=device).float()
-        sample_timesteps = torch.randint(0, 1000, (batch_size,), device=device).float()
-        out = model(data_clone.x, data_clone.edge_index, sample_timesteps, sample_classes)
+        
+        # batch_size = data_clone.num_graphs
+        # sample_classes = torch.randint(0, 2, (batch_size, model.cond_dim), device=device).float()
+        # sample_timesteps = torch.randint(0, 1000, (batch_size,), device=device).float()
+        # out = model(data_clone.x, data_clone.edge_index, sample_timesteps, sample_classes)
+        out = model(data_clone.x, data_clone.edge_index)# , sample_timesteps, sample_classes)
+
         targets = data_clone.y
         loss_criterion = nn.MSELoss(reduction = 'none')
         loss_per_var = loss_criterion(out, targets).mean(dim = 0)
@@ -1151,12 +1194,12 @@ if __name__ == '__main__':
         dim=64,
         in_channels=4,
         out_channels=1,
-        cond_dim=2,
+        # cond_dim=2,
         cond_drop_prob=0.0,
         dim_mults=(1, 2, 4),
         pool_ratios=0.5,
         sum_res=False,
-        act='relu',
+        act=nn.SiLU(),
     )
     print(model)
     model = model.to(device)
@@ -1164,8 +1207,8 @@ if __name__ == '__main__':
     
     train_dataset_obj.create_splits(train_ratio=0.9, val_ratio=0.05, test_ratio=0.05, seed=42)
     train_loader = DataLoader(train_dataset_obj.train_dataset, batch_size=batch_size, shuffle=True)
-    for i in range(600):
-        print(f"Epoch {i+1}/300")
+    for i in range(5000):
+        print(f"Epoch {i+1}/5000", flush=True)
         train(device, model, train_loader, optimizer)
         # Inference and plotting
     model.eval()
@@ -1174,12 +1217,12 @@ if __name__ == '__main__':
         test_sample = train_dataset_obj.test_dataset[0].to(device)
         
         # Make prediction
-        # prediction = model(test_sample.x, test_sample.edge_index)
+        prediction = model(test_sample.x, test_sample.edge_index)
         # prediction = model(test_sample.x)
         # batch_size = test_sample.num_graphs
-        sample_classes = torch.randint(0, 2, (1, model.cond_dim), device=device).float()
-        sample_timesteps = torch.randint(0, 1000, (1,), device=device).float()
-        prediction = model(test_sample.x, test_sample.edge_index, sample_timesteps, sample_classes)
+        # sample_classes = torch.randint(0, 2, (1, model.cond_dim), device=device).float()
+        # sample_timesteps = torch.randint(0, 1000, (1,), device=device).float()
+        # prediction = model(test_sample.x, test_sample.edge_index, sample_timesteps, sample_classes)
         
         # Move to CPU and convert to numpy
         pred_np = prediction.cpu().numpy().squeeze()
@@ -1219,8 +1262,62 @@ if __name__ == '__main__':
     plt.savefig('pressure_comparison.png', dpi=150)
     plt.show()
 
-    print(f"Mean Absolute Error: {error.mean():.4f}")
-    print(f"Max Error: {error.max():.4f}")
+    # Basic error metrics
+    mae = error.mean()
+    max_err = error.max()
+
+    # MSE / RMSE
+    sq_error = (true_denorm - pred_denorm) ** 2
+    mse = sq_error.mean()
+    rmse = np.sqrt(mse)
+
+    # Percentiles for absolute error
+    pctiles = [50, 75, 90, 95, 99]
+    abs_percentiles = np.percentile(error, pctiles)
+
+    # Percentiles for squared error (report as RMSE at percentile by sqrt)
+    sq_percentiles = np.percentile(sq_error, pctiles)
+    rmse_percentiles = np.sqrt(sq_percentiles)
+
+    # Relative errors (avoid divide by zero)
+    eps = 1e-12
+    rel_error = error / (np.abs(true_denorm) + eps)
+    rel_mean = rel_error.mean()
+    rel_max = rel_error.max()
+    rel_percentiles = np.percentile(rel_error, pctiles)
+
+    # Normalized RMSE (by std and by range)
+    true_std = np.std(true_denorm)
+    true_range = (np.max(true_denorm) - np.min(true_denorm)) if np.max(true_denorm) != np.min(true_denorm) else eps
+    nrmse_std = rmse / (true_std + eps)
+    nrmse_range = rmse / (true_range + eps)
+
+    # Print summary
+    print(f"Mean Absolute Error (MAE): {mae:.6f}")
+    print(f"Max Absolute Error: {max_err:.6f}")
+    print(f"Mean Squared Error (MSE): {mse:.6f}")
+    print(f"Root MSE (RMSE): {rmse:.6f}")
+    print(f"NRMSE (by std): {nrmse_std:.6f}, NRMSE (by range): {nrmse_range:.6f}")
+    print()
+    print("Absolute error percentiles:")
+    for p, v in zip(pctiles, abs_percentiles):
+        print(f"  {p}th percentile abs error: {v:.6f}")
+    print()
+    print("RMSE at squared-error percentiles (sqrt of percentile MSE):")
+    for p, v in zip(pctiles, rmse_percentiles):
+        print(f"  {p}th percentile RMSE: {v:.6f}")
+    print()
+    print("Relative error (absolute / |truth|) stats:")
+    print(f"  Mean relative error: {rel_mean:.6f}")
+    print(f"  Max relative error: {rel_max:.6f}")
+    for p, v in zip(pctiles, rel_percentiles):
+        print(f"  {p}th percentile relative error: {v:.6f}")
+
+    # keep the original prints for convenience
+    print()
+    print(f"Mean Absolute Error: {mae:.4f}")
+    print(f"Max Error: {max_err:.4f}")
+    print()
 
     # Create the scatter plot
     # plt.figure()
