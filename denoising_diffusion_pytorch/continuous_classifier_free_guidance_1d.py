@@ -349,7 +349,8 @@ class Unet1D(Module):
         attn_dim_head = 32,
         attn_heads = 4,
         full_attn=False,
-        cross_attn=False
+        cross_attn=False,
+        self_condition = False,
     ):
         super().__init__()
 
@@ -357,7 +358,8 @@ class Unet1D(Module):
         # determine dimensions
         self.channels = channels
         self.cond_dim = cond_dim
-        input_channels = channels
+        self.self_condition = self_condition
+        input_channels = channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv1d(input_channels, init_dim, 7, padding = 3)
@@ -472,7 +474,7 @@ class Unet1D(Module):
 
         return interpolated_rescaled_logits, null_logits
 
-    def forward(self, x, time, classes, cond_drop_prob=None):
+    def forward(self, x, time, classes, x_self_cond = None, cond_drop_prob=None):
 
         batch, device = x.shape[0], x.device
         cond_drop_prob = default(cond_drop_prob, self.cond_drop_prob)
@@ -486,12 +488,17 @@ class Unet1D(Module):
                 classes,
                 null_classes_emb
             )
-
+        if self.self_condition:
+            x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
+            x = torch.cat((x_self_cond, x), dim = 1)
         c = self.classes_mlp(classes)
         x = self.init_conv(x)
         r = x.clone()
 
-        t = self.time_mlp(time)
+        if time is not None:
+            t = self.time_mlp(time)
+        else:
+            t = None
 
         h = []
 
@@ -582,6 +589,7 @@ class GaussianDiffusion1D(Module):
         self.model = model
         self.channels = default(channels, lambda: self.model.channels)
         self.cond_dim = self.model.cond_dim
+        self.self_condition = self.model.self_condition
         self.channel_first = channel_first
         self.seq_index = -2 if not channel_first else -1
 
@@ -699,9 +707,9 @@ class GaussianDiffusion1D(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, classes, clip_x_start = False,  cond_scale = 6., rescaled_phi = 0.7, rederive_pred_noise = False):
+    def model_predictions(self, x, t, classes, x_self_cond=None, clip_x_start = False, cond_scale = 6., rescaled_phi = 0.7, rederive_pred_noise = False):
         # model_output_null will be useful if i want to add cfg++ (i think)
-        model_output, model_output_null = self.model.forward_with_cond_scale(x, t, classes, cond_scale = cond_scale, rescaled_phi = rescaled_phi)
+        model_output, model_output_null = self.model.forward_with_cond_scale(x, t, classes, x_self_cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -726,8 +734,8 @@ class GaussianDiffusion1D(Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, classes, cond_scale, rescaled_phi, clip_denoised = True):
-        preds = self.model_predictions(x, t, classes, cond_scale, rescaled_phi)
+    def p_mean_variance(self, x, t, classes, cond_scale, rescaled_phi, x_self_cond=None, clip_denoised = True):
+        preds = self.model_predictions(x, t, classes, cond_scale=cond_scale, rescaled_phi=rescaled_phi, x_self_cond=x_self_cond)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -737,10 +745,10 @@ class GaussianDiffusion1D(Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, classes, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
+    def p_sample(self, x, t: int, classes, x_self_cond=None, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x=x, t=batched_times, classes=classes, cond_scale=cond_scale, rescaled_phi=rescaled_phi, clip_denoised = clip_denoised)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x=x, t=batched_times, classes=classes, x_self_cond=x_self_cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi, clip_denoised = clip_denoised)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
@@ -755,7 +763,8 @@ class GaussianDiffusion1D(Module):
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
-            img, x_start = self.p_sample(img, t, classes, cond_scale, rescaled_phi)
+            self_cond = x_start if self.self_condition else None
+            img, x_start = self.p_sample(img, t, classes, self_cond, cond_scale, rescaled_phi)
 
         img = self.unnormalize(img)
 
@@ -779,7 +788,8 @@ class GaussianDiffusion1D(Module):
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, cond_scale=cond_scale, rescaled_phi=rescaled_phi, clip_x_start = clip_denoised)
+            self_cond = x_start if self.self_condition else None
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, self_cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi, clip_x_start=clip_denoised)
 
             if time_next < 0:
                 img = x_start
@@ -827,7 +837,8 @@ class GaussianDiffusion1D(Module):
         x_start = None
 
         for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
-            img, x_start = self.p_sample(img, i, classes)
+            self_cond = x_start if self.self_condition else None
+            img, x_start = self.p_sample(img, i, classes, self_cond=self_cond)
 
         return img
 
@@ -856,7 +867,7 @@ class GaussianDiffusion1D(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, *, classes, noise = None, return_reduced_loss = True):
+    def p_losses(self, x_start, t, *, classes, noise = None, ):#return_reduced_loss = True):
         b = x_start.shape[0]
         n = x_start.shape[self.seq_index]
 
@@ -871,8 +882,13 @@ class GaussianDiffusion1D(Module):
         # this technique will slow down training by 25%, but seems to lower FID significantly
 
         # predict and take gradient step
+        x_self_cond = None
+        if self.self_condition and random() < 0.5:
+            with torch.no_grad():
+                x_self_cond = self.model_predictions(x, t, classes).pred_x_start
+                x_self_cond.detach_()
 
-        model_out = self.model(x, t, classes)
+        model_out = self.model(x, t, classes, x_self_cond)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -886,8 +902,8 @@ class GaussianDiffusion1D(Module):
 
         loss = F.mse_loss(model_out, target, reduction = 'none')
 
-        if not return_reduced_loss:
-            return loss * extract(self.loss_weight, t, loss.shape)
+        # if not return_reduced_loss:
+        #     return loss * extract(self.loss_weight, t, loss.shape)
 
         loss = reduce(loss, 'b ... -> b', 'mean')
 
@@ -926,7 +942,8 @@ class Trainer1D(object):
         mixed_precision_type = 'fp16',
         split_batches = True,
         max_grad_norm = 1.,
-        use_cpu=False
+        use_cpu=False,
+        dataset_test=None
     ):
         super().__init__()
 
@@ -958,13 +975,16 @@ class Trainer1D(object):
         # dataset and dataloader
 
         dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 4)
-
+        if dataset_test is not None:
+            self.dl_test = DataLoader(dataset_test, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 4)
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
         # optimizer
 
         self.opt = AdamW(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=1e-4, fused=True)
+        # cosine annealing lr scheduler
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.train_num_steps, eta_min=1e-6)
 
         # for logging results in a folder periodically
 
@@ -981,9 +1001,10 @@ class Trainer1D(object):
 
         # prepare model, dataloader, optimizer with accelerator
         self.cond_dim = diffusion_model.cond_dim
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        self.model, self.opt, self.scheduler = self.accelerator.prepare(self.model, self.opt, self.scheduler)
 
         self.loss_history = []
+        self.test_loss_history = []
 
     @property
     def device(self):
@@ -1000,7 +1021,8 @@ class Trainer1D(object):
             'ema': self.ema.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__,
-            'loss_history': torch.tensor(self.loss_history)
+            'loss_history': torch.tensor(self.loss_history),
+            'test_loss_history': torch.tensor(self.test_loss_history)
         }
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
@@ -1027,6 +1049,9 @@ class Trainer1D(object):
             
         if exists(data['loss_history']):
             self.loss_history = data['loss_history'].tolist()
+
+        if exists(data['test_loss_history']):
+            self.test_loss_history = data['test_loss_history'].tolist()
 
     def train(self):
         accelerator = self.accelerator
@@ -1055,26 +1080,37 @@ class Trainer1D(object):
 
                 self.opt.step()
                 self.opt.zero_grad()
+                self.scheduler.step()
 
                 accelerator.wait_for_everyone()
 
                 self.step += 1
                 if accelerator.is_main_process:
                     self.loss_history.append(total_loss)
-                    pbar.set_description(f'loss: {total_loss:.4f}')
+                    pbar.set_description(f'loss: {total_loss:.5f}')
                     self.ema.update()
 
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
                         self.ema.ema_model.eval()
 
+                        # with torch.no_grad():
+                        #     milestone = self.step // self.save_and_sample_every
+                        #     random_classes = torch.rand((self.num_samples, self.cond_dim), device=device)
+                        #     batches = torch.split(random_classes, self.batch_size)
+                        #     all_samples_list = list(map(lambda n: self.ema.ema_model.sample(classes=n), batches))
+                        all_samples_list = []
                         with torch.no_grad():
+                            test_losses = []
                             milestone = self.step // self.save_and_sample_every
-                            random_classes = torch.rand((self.num_samples, self.cond_dim), device=device)
-                            batches = torch.split(random_classes, self.batch_size)
-                            all_samples_list = list(map(lambda n: self.ema.ema_model.sample(classes=n), batches))
+                            for data in self.dl_test:
+                                sequence, classes = data[0].to(device), data[1].to(device)
+                                pred = self.ema.ema_model.sample(classes=classes)
+                                all_samples_list.append(pred)
+                                mse = ((pred - sequence) ** 2).mean()
+                                test_losses.append(mse.cpu().numpy())
 
                         all_samples = torch.cat(all_samples_list, dim = 0)
-
+                        self.test_loss_history.append(np.mean(test_losses))
                         torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.pt'))
                         self.save(milestone)
 
@@ -1083,6 +1119,10 @@ class Trainer1D(object):
         if accelerator.is_main_process:
             plt.figure()
             plt.plot(self.loss_history, label='Loss')
+            if self.test_loss_history:
+                test_x_values = list(range(self.save_and_sample_every, self.train_num_steps+1, self.save_and_sample_every))
+                print(test_x_values, self.test_loss_history)
+                plt.plot(test_x_values, self.test_loss_history, label='Test Loss')    
             # Compute moving average
             window_size = 100
             if len(self.loss_history) >= window_size:
