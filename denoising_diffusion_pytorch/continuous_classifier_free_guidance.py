@@ -184,47 +184,53 @@ class Block(nn.Module):
     def __init__(self, dim, dim_out, dropout = 0.):
         super().__init__()
         self.proj = nn.Conv2d(dim, dim_out, 3, padding = 1)
-        self.norm = RMSNorm(dim_out)
+        self.norm = RMSNorm(dim)
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, scale_shift = None):
-        x = self.proj(x)
         x = self.norm(x)
 
         if exists(scale_shift):
-            scale, shift = scale_shift
+            scale, shift, gate = scale_shift
             x = x * (scale + 1) + shift
 
+        x = self.proj(x)
         x = self.act(x)
+        if exists(scale_shift):
+            x = x * gate
         return self.dropout(x)
 
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim = None, classes_emb_dim = None):
+    def __init__(self, dim, dim_out, *, time_emb_dim = None, classes_emb_dim = None, dropout = 0.):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim_out * 2)
+            # (scale, shift, gate) for block1 (scale, shift, gate) for block2
+            nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim * 2 + dim_out * 4)
+            # nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim_out * 2)
         ) if exists(time_emb_dim) or exists(classes_emb_dim) else None
-
-        self.block1 = Block(dim, dim_out)
-        self.block2 = Block(dim_out, dim_out)
+        self.dim_in = dim
+        self.dim_out = dim_out
+        self.block1 = Block(dim, dim_out, dropout)
+        self.block2 = Block(dim_out, dim_out, dropout)
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb = None, class_emb = None):
 
-        scale_shift = None
+        # scale_shift_gate_block = None
         if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
             cond_emb = tuple(filter(exists, (time_emb, class_emb)))
             cond_emb = torch.cat(cond_emb, dim = -1)
             cond_emb = self.mlp(cond_emb)
             cond_emb = rearrange(cond_emb, 'b c -> b c 1 1')
-            scale_shift = cond_emb.chunk(2, dim = 1)
+            # scale_shift_gate = torch.split(cond_emb, [self.dim_out, self.dim_out], dim=1)
+            # first_chunk, second_chunk = cond_emb.chunk(2, dim=1)
+            scale_shift_gate_block = torch.split(cond_emb, [self.dim_in, self.dim_in, self.dim_out, self.dim_out, self.dim_out, self.dim_out], dim=1)
 
-        h = self.block1(x, scale_shift = scale_shift)
+        h = self.block1(x, scale_shift=scale_shift_gate_block[:3] if scale_shift_gate_block is not None else None)
 
-        h = self.block2(h)
-
+        h = self.block2(h, scale_shift=scale_shift_gate_block[3:] if scale_shift_gate_block is not None else None)
         return h + self.res_conv(x)
 
 class LinearAttention(nn.Module):
@@ -916,7 +922,8 @@ class Trainer:
         max_grad_norm = 1.,
         num_fid_samples = 50000,
         save_best_and_latest_only = False,
-        use_cpu=False
+        use_cpu=False,
+        use_lr_scheduler=True
     ):
         super().__init__()
 
@@ -925,7 +932,8 @@ class Trainer:
         self.accelerator = Accelerator(
             mixed_precision = mixed_precision_type if amp else 'no',
             cpu=use_cpu,
-            dataloader_config=DataLoaderConfiguration(split_batches=split_batches)
+            dataloader_config=DataLoaderConfiguration(split_batches=split_batches),
+            gradient_accumulation_steps=gradient_accumulate_every
         )
 
         # model
@@ -965,7 +973,7 @@ class Trainer:
             self.ds = dataset
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
-        dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=4)
+        dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=4, persistent_workers=True)
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
@@ -973,8 +981,11 @@ class Trainer:
         # optimizer
 
         self.opt = AdamW(diffusion_model.parameters(), lr = train_lr, betas = adam_betas, weight_decay=1e-4)
+        # cosine annealing lr scheduler
+        self.use_lr_scheduler = use_lr_scheduler
+        if use_lr_scheduler:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.train_num_steps, eta_min=1e-6)
 
-        # for logging results in a folder periodically
 
         if self.accelerator.is_main_process:
             self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
@@ -990,36 +1001,8 @@ class Trainer:
         # prepare model, dataloader, optimizer with accelerator
         self.cond_dim = diffusion_model.cond_dim
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
-
-        # FID-score computation
-
-        self.calculate_fid = calculate_fid and self.accelerator.is_main_process
-
-        if self.calculate_fid:
-            from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
-
-
-            if not is_ddim_sampling:
-                self.accelerator.print(
-                    "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming."\
-                    "Consider using DDIM sampling to save time."
-                )
-
-            self.fid_scorer = FIDEvaluation(
-                batch_size=self.batch_size,
-                dl=self.dl,
-                sampler=self.ema.ema_model,
-                channels=self.channels,
-                accelerator=self.accelerator,
-                stats_dir=results_folder,
-                device=self.device,
-                num_fid_samples=num_fid_samples,
-                inception_block_idx=inception_block_idx
-            )
-
-        if save_best_and_latest_only:
-            assert calculate_fid, "`calculate_fid` must be True to provide a means for model evaluation for `save_best_and_latest_only`."
-            self.best_fid = 1e10 # infinite
+        if use_lr_scheduler:
+            self.scheduler = self.accelerator.prepare(self.scheduler)
 
         self.save_best_and_latest_only = save_best_and_latest_only
         self.all_losses = []
@@ -1036,6 +1019,7 @@ class Trainer:
             'step': self.step,
             'model': self.accelerator.get_state_dict(self.model),
             'opt': self.opt.state_dict(),
+            'scheduler': self.scheduler.state_dict() if self.use_lr_scheduler else None,
             'ema': self.ema.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__,
@@ -1067,6 +1051,9 @@ class Trainer:
         if exists(data['loss_history']):
             self.all_losses = data['loss_history'].tolist()
 
+        if exists(data['scheduler']) and self.use_lr_scheduler:
+            self.scheduler.load_state_dict(data['scheduler'])
+
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
@@ -1077,29 +1064,33 @@ class Trainer:
 
                 total_loss = 0.
 
-                for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl)#.to(device)
+                # for _ in range(self.gradient_accumulate_every):
+                data = next(self.dl)#.to(device)
+                with accelerator.accumulate(self.model):
                     imgs, classes = data[0].to(device), data[1].to(device)
 
                     with self.accelerator.autocast():
                         loss = self.model(imgs, classes=classes)
-                        loss = loss / self.gradient_accumulate_every
+                        # loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
                     self.accelerator.backward(loss)
 
-                accelerator.wait_for_everyone()
-                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    # accelerator.wait_for_everyone()
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-                self.opt.step()
-                self.opt.zero_grad()
+                    self.opt.step()
+                    self.opt.zero_grad()
+                    if self.use_lr_scheduler:
+                        self.scheduler.step()
 
-                accelerator.wait_for_everyone()
+                    # accelerator.wait_for_everyone()
 
                 self.step += 1
-                if accelerator.is_main_process:
+                if accelerator.is_main_process and accelerator.sync_gradients:
                     self.all_losses.append(total_loss)
-                    pbar.set_description(f'loss: {total_loss:.4f}')
+                    pbar.set_description(f'loss: {total_loss:.5f}')
                     pbar.update(1)
                     self.ema.update()
 
@@ -1124,25 +1115,13 @@ class Trainer:
                                 image = all_images[i, 0].squeeze()
                             else:
                                 image = all_images[i].squeeze()
-                            im = ax.imshow(image.squeeze())#, vmin=np.min(simulations), vmax=np.max(simulations))#, cmap="jet")
+                            im = ax.imshow(image.squeeze(), cmap='RdBu_r')#, vmin=np.min(simulations), vmax=np.max(simulations))#, cmap="jet")
                             ax.set_title(f"Alpha1={random_classes[i][0].item():.2f}, Alpha2={random_classes[i][1].item():.2f}")
                             plt.colorbar(im, ax=ax)
                             ax.axis('off')
                         plt.savefig(self.results_folder / f"colored_grid{milestone}.png", bbox_inches="tight", pad_inches=0)
                         plt.close()
                         # whether to calculate fid
-
-                        if self.calculate_fid:
-                            fid_score = self.fid_scorer.fid_score()
-                            accelerator.print(f'fid_score: {fid_score}')
-
-                        if self.save_best_and_latest_only:
-                            if self.best_fid > fid_score:
-                                self.best_fid = fid_score
-                                self.save("best")
-                            self.save("latest")
-                        else:
-                            self.save(milestone)
                         milestone = self.step // self.save_and_sample_every
                         self.save(milestone)
                 
