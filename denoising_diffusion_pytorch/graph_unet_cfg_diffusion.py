@@ -1,5 +1,5 @@
 from torch_geometric.nn import GraphUNet
-from torch_geometric.loader import DataLoader
+from torch_geometric.loader import DataLoader as DataLoaderGeom 
 from torch_geometric.nn import knn_graph, radius_graph
 from torch_geometric.utils.repeat import repeat as repeat_geom
 
@@ -16,10 +16,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn, autocast
 from torch import Tensor
-from torch.utils.data import Dataset
+from torch import nn, einsum
+from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 from accelerate import Accelerator, DataLoaderConfiguration
 
@@ -172,6 +174,41 @@ def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1
 #         tensor = rearrange(tensor, 'b n -> (b n) 1')
 #     return tensor
 
+class GraphAttention(nn.Module):
+    def __init__(self, dim, heads = 4, dim_head = 32):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        hidden_dim = dim_head * heads
+        self.norm = RMSNorm(dim)
+        self.to_qkv = GCNConv(dim, hidden_dim * 3, bias = False, improved=True)
+        self.to_out = GCNConv(hidden_dim, dim, 1)
+
+    def forward(self, x, edge_index, edge_weight):
+        # b, c, h, w = x.shape
+        batch_size = x.shape[0]
+        x = self.norm(x)
+        x = rearrange(x, 'b c n -> (b n) c')
+        qkv = self.to_qkv(x, edge_index, edge_weight)# .chunk(3, dim = 1)
+        qkv = rearrange(qkv, '(b n) c -> b c n', b=batch_size)
+        qkv = qkv.chunk(3, dim=1)
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) n -> b h c n', h = self.heads), qkv)
+
+        q = q * self.scale
+
+        sim = einsum('b h d i, b h d j -> b h i j', q, k)
+        attn = sim.softmax(dim = -1)
+        out = einsum('b h i j, b h d j -> b h i d', attn, v)
+        out = rearrange(out, 'b h n d -> b (h d) n')
+        out = rearrange(out, 'b c n -> (b n) c')
+        out = self.to_out(out, edge_index, edge_weight)
+        out = rearrange(out, '(b n) c -> b c n', b=batch_size)
+        return out
+    
+    def reset_parameters(self):
+        self.to_qkv.reset_parameters()
+        self.to_out.reset_parameters()
+
 
 class GraphBlock(nn.Module):
     def __init__(self, dim, dim_out, time_emb_dim=None, classes_emb_dim=None):
@@ -195,6 +232,7 @@ class GraphBlock(nn.Module):
         x = rearrange(x, '(b n) c -> b c n', b=batch_size)
         # print(x.shape)
         if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
+            # print(time_emb.shape, class_emb.shape)
             cond_emb = tuple(filter(exists, (time_emb, class_emb)))
             cond_emb = torch.cat(cond_emb, dim = -1)
             # print("cond_emb", cond_emb.shape)
@@ -272,6 +310,8 @@ class ConditionedGraphUNet(torch.nn.Module):
         pool_ratios: Union[float, List[float]] = 0.5,
         sum_res: bool = False,
         act: Union[str, Callable] = 'relu',
+        attn_heads=4,
+        attn_dim_head=32
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -318,19 +358,21 @@ class ConditionedGraphUNet(torch.nn.Module):
         self.pools = torch.nn.ModuleList()
         self.ups = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(in_out):
-            self.downs.append(
+            self.downs.append(nn.ModuleList([
                 GraphBlock(dim=dim_in, dim_out=dim_out, time_emb_dim=time_dim, classes_emb_dim=classes_dim),
-            )
+                GraphAttention(dim_out, attn_heads, attn_dim_head)
+            ]))
             # pooling occurs after the GraphBlock
             self.pools.append(TopKPooling(dim_out, self.pool_ratios[ind]))
 
         self.mid_block1 = GraphBlock(dim=dims[-1], dim_out=dims[-1], time_emb_dim=time_dim, classes_emb_dim=classes_dim)
-
+        self.mid_attn = GraphAttention(dims[-1], attn_heads, attn_dim_head)
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             in_channels = dim_out if sum_res else 2 * dim_out # dim_in + dim_out # 2 * dim_out #
-            self.ups.append(
+            self.ups.append(nn.ModuleList([
                 GraphBlock(dim=in_channels, dim_out=dim_in, time_emb_dim=time_dim, classes_emb_dim=classes_dim),
-            )
+                GraphAttention(dim_in, attn_heads, attn_dim_head)
+            ]))
         self.out_conv = GCNConv(dim, out_channels, improved=True)
         self.reset_parameters()
 
@@ -339,10 +381,12 @@ class ConditionedGraphUNet(torch.nn.Module):
         self.init_conv.reset_parameters()
         self.mid_block1.reset_parameters()
         self.out_conv.reset_parameters()
-        for block in self.downs:
+        for block, attn in self.downs:
             block.reset_parameters()
-        for block in self.ups:
+            attn.reset_parameters()
+        for block, attn in self.ups:
             block.reset_parameters()
+            attn.reset_parameters()
 
 
     def forward(self, x: Tensor, edge_index: Tensor,
@@ -372,12 +416,12 @@ class ConditionedGraphUNet(torch.nn.Module):
         xs, edge_indices, edge_weights = [], [], []
         perms = []
 
-        for i in range(len(self.downs)):
+        for i, (block, attn) in enumerate(self.downs):
             # X: (B, C_in, N) --> (B, C_out, N)
             # print(f"block {i} x shape", x.shape)
-            x = self.downs[i](x, edge_index, edge_weight, **conditioning_args)
+            x = block(x, edge_index, edge_weight, **conditioning_args)
+            x = attn(x, edge_index, edge_weight)
             # x = self.act(x)
-
             xs.append(x)
             edge_indices.append(edge_index)
             edge_weights.append(edge_weight)
@@ -393,8 +437,9 @@ class ConditionedGraphUNet(torch.nn.Module):
             perms.append(perm)
 
         x = self.mid_block1(x, edge_index, edge_weight, **conditioning_args)
+        x = self.mid_attn(x, edge_index, edge_weight)
 
-        for i in range(len(self.ups)):
+        for i, (block, attn) in enumerate(self.ups):
             res = xs.pop()
             edge_index = edge_indices.pop()
             edge_weight = edge_weights.pop()
@@ -410,7 +455,8 @@ class ConditionedGraphUNet(torch.nn.Module):
             x = res + up if self.sum_res else torch.cat((res, up), dim=-1)
 
             x = rearrange(x, '(b n) c -> b c n', b=batch_size)
-            x = self.ups[i](x, edge_index, edge_weight, **conditioning_args)
+            x = block(x, edge_index, edge_weight, **conditioning_args)
+            x = attn(x, edge_index, edge_weight)
             # x = self.act(x)
 
         x = rearrange(x, 'b c n -> (b n) c')
@@ -839,6 +885,7 @@ class Trainer:
         max_grad_norm=1.0,
         save_best_and_latest_only=False,
         use_cpu=False,
+        dl_collate_fn=None
     ):
         super().__init__()
 
@@ -872,8 +919,10 @@ class Trainer:
         self.ds = dataset
 
         # this is the dataloader from torch geometric
-        dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=4)
-
+        if dl_collate_fn is None:
+            dl = DataLoaderGeom(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=4)
+        else:
+            dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=4, collate_fn=dl_collate_fn)
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
@@ -1164,7 +1213,6 @@ def train(device, model, train_loader, optimizer):
 
 if __name__ == '__main__':
     from torch_geometric.data import Data
-    import matplotlib.pyplot as plt
     data_directory = 'data/aeronef/'
     save_directory = 'data/aeronef/'
     batch_size = 16
