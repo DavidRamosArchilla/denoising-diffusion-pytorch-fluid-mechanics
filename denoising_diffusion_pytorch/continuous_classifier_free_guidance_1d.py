@@ -27,7 +27,7 @@ from denoising_diffusion_pytorch.version import __version__
 
 # constants
 
-ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
+ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start', 'pred_variance'])
 
 # helpers functions
 
@@ -101,18 +101,25 @@ def project(x, y):
 
     return inverse(parallel).to(dtype), inverse(orthogonal).to(dtype)
 
-# data
+def _extract_into_tensor(arr, timesteps, broadcast_shape):
+    """
+    Extract values from a 1-D numpy array for a batch of indices.
+    :param arr: the 1-D numpy array.
+    :param timesteps: a tensor of indices into the array to extract.
+    :param broadcast_shape: a larger shape of K dimensions with the batch
+                            dimension equal to the length of timesteps.
+    :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
+    """
+    res = torch.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
+    while len(res.shape) < len(broadcast_shape):
+        res = res[..., None]
+    return res + torch.zeros(broadcast_shape, device=timesteps.device)
 
-class Dataset1D(Dataset):
-    def __init__(self, tensor: Tensor):
-        super().__init__()
-        self.tensor = tensor.clone()
-
-    def __len__(self):
-        return len(self.tensor)
-
-    def __getitem__(self, idx):
-        return self.tensor[idx].clone()
+def mean_flat(tensor):
+    """
+    Take the mean over all non-batch dimensions.
+    """
+    return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
 # small helper modules
 
@@ -341,7 +348,7 @@ class Unet1D(Module):
         dim_mults=(1, 2, 4, 8),
         channels = 3,
         dropout = 0.,
-        learned_variance = False,
+        learn_sigma = False,
         learned_sinusoidal_cond = False,
         random_fourier_features = False,
         learned_sinusoidal_dim = 16,
@@ -359,6 +366,7 @@ class Unet1D(Module):
         self.channels = channels
         self.cond_dim = cond_dim
         self.self_condition = self_condition
+        self.learn_sigma = learn_sigma
         input_channels = channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
@@ -436,7 +444,7 @@ class Unet1D(Module):
                 Upsample(dim_out, dim_in) if not is_last else  nn.Conv1d(dim_out, dim_in, 3, padding = 1)
             ]))
 
-        default_out_dim = channels * (1 if not learned_variance else 2)
+        default_out_dim = channels * (1 if not learn_sigma else 2)
         self.out_dim = default(out_dim, default_out_dim)
 
         self.final_res_block = resnet_block(init_dim * 2, init_dim)
@@ -709,11 +717,15 @@ class GaussianDiffusion1D(Module):
 
     def model_predictions(self, x, t, classes, x_self_cond=None, clip_x_start = False, cond_scale = 6., rescaled_phi = 0.7, rederive_pred_noise = False):
         # model_output_null will be useful if i want to add cfg++ (i think)
-        model_output, model_output_null = self.model.forward_with_cond_scale(x, t, classes, x_self_cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi)
+        model_output, model_output_null = self.model.forward_with_cond_scale(x, t, classes, x_self_cond=x_self_cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
-
+        learned_var = None
+        if self.model.learn_sigma:
+            preds, learned_var = model_output.chunk(2, dim=1) # 1 is the channel dimension
+        else:
+            preds = model_output
         if self.objective == 'pred_noise':
-            pred_noise = model_output
+            pred_noise = preds
             x_start = self.predict_start_from_noise(x, t, pred_noise)
             x_start = maybe_clip(x_start)
 
@@ -722,26 +734,35 @@ class GaussianDiffusion1D(Module):
                 pred_noise = self.predict_noise_from_start(x, t, x_start)
 
         elif self.objective == 'pred_x0':
-            x_start = model_output
+            x_start = preds
             x_start = maybe_clip(x_start)
             pred_noise = self.predict_noise_from_start(x, t, x_start)
 
         elif self.objective == 'pred_v':
-            v = model_output
+            v = preds
             x_start = self.predict_start_from_v(x, t, v)
             x_start = maybe_clip(x_start)
             pred_noise = self.predict_noise_from_start(x, t, x_start)
 
-        return ModelPrediction(pred_noise, x_start)
+        return ModelPrediction(pred_noise, x_start, learned_var)
 
-    def p_mean_variance(self, x, t, classes, cond_scale, rescaled_phi, x_self_cond=None, clip_denoised = True):
+    def p_mean_variance(self, x, t, classes, cond_scale, rescaled_phi, x_self_cond=None, clip_denoised=True):
         preds = self.model_predictions(x, t, classes, cond_scale=cond_scale, rescaled_phi=rescaled_phi, x_self_cond=x_self_cond)
         x_start = preds.pred_x_start
 
         if clip_denoised:
             x_start.clamp_(-1., 1.)
-
-        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
+        if preds.pred_variance is not None:
+            model_mean, _, _ = self.q_posterior(x_start=x_start, x_t=x, t=t)
+            min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
+            max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
+            # The predicted variance is [-1, 1] for [min_var, max_var].
+            frac = (preds.pred_variance + 1) / 2
+            # interpolation in log space between min and max log variance
+            posterior_log_variance = frac * max_log + (1 - frac) * min_log
+            posterior_variance = torch.exp(posterior_log_variance)
+        else:
+            model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
@@ -888,7 +909,20 @@ class GaussianDiffusion1D(Module):
                 x_self_cond = self.model_predictions(x, t, classes).pred_x_start
                 x_self_cond.detach_()
 
-        model_out = self.model(x, t, classes, x_self_cond)
+        model_out = self.model(x, t, classes, x_self_cond=x_self_cond)
+
+        if self.model.learn_sigma:
+            model_out, learned_var = model_out.chunk(2, dim=1)
+             # Learn the variance using the variational bound, but don't let
+            # it affect our mean prediction.
+            var_loss = self._vb_terms_bpd(
+                model_pred_noise=model_out.detach(),
+                model_var_pred=learned_var.detach(),
+                x_start=x_start,
+                x_t=x,
+                t=t,
+                clip_denoised=False,
+            )
 
         if self.objective == 'pred_noise':
             target = noise
@@ -908,8 +942,51 @@ class GaussianDiffusion1D(Module):
         loss = reduce(loss, 'b ... -> b', 'mean')
 
         loss = loss * extract(self.loss_weight, t, loss.shape)
+        # add the variance loss term if learning variance
+        loss = loss.mean() + (var_loss.mean() if self.model.learn_sigma else 0.)
+        return loss
 
-        return loss.mean()
+    def _vb_terms_bpd(
+            self, model_pred_noise, model_var_pred, x_start, x_t, t, clip_denoised=True, model_kwargs=None
+    ):
+        """
+        Get a term for the variational lower-bound.
+        The resulting units are bits (rather than nats, as one might expect).
+        This allows for comparison to other papers.
+        :return: a dict with the following keys:
+                 - 'output': a shape [N] tensor of NLLs or KLs.
+                 - 'pred_xstart': the x_0 predictions.
+        """
+        true_mean, _, true_log_variance_clipped = self.q_posterior(
+            x_start=x_start, x_t=x_t, t=t
+        )
+        x_start_pred = self.predict_start_from_noise(x_t, t, model_pred_noise)
+        if clip_denoised:
+            x_start.clamp_(-1., 1.)
+            x_start_pred.clamp_(-1., 1.)
+        model_mean, _, _ = self.q_posterior(x_start=x_start_pred, x_t=x_t, t=t)
+        min_log = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        max_log = extract(torch.log(self.betas), t, x_t.shape)
+        # The predicted variance is [-1, 1] for [min_var, max_var].
+        frac = (model_var_pred + 1) / 2
+        # interpolation in log space between min and max log variance
+        posterior_log_variance = frac * max_log + (1 - frac) * min_log
+    
+        kl = normal_kl(
+            true_mean, true_log_variance_clipped, model_mean, posterior_log_variance
+        )
+        kl = mean_flat(kl) / np.log(2.0)
+
+        decoder_nll = -discretized_gaussian_log_likelihood(
+            x_start, means=model_mean, log_scales=0.5 * posterior_log_variance
+        )
+        assert decoder_nll.shape == x_start.shape
+        decoder_nll = mean_flat(decoder_nll) / np.log(2.0)
+
+        # At the first timestep return the decoder NLL,
+        # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
+        output = torch.where((t == 0), decoder_nll, kl)
+        return output
 
     def forward(self, img, *args, **kwargs):
         b, n, device, seq_length, = img.shape[0], img.shape[self.seq_index], img.device, self.seq_length
@@ -919,6 +996,73 @@ class GaussianDiffusion1D(Module):
 
         img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
+
+# diffusion utils
+
+def normal_kl(mean1, logvar1, mean2, logvar2):
+    """
+    Compute the KL divergence between two gaussians.
+    Shapes are automatically broadcasted, so batches can be compared to
+    scalars, among other use cases.
+    """
+    tensor = None
+    for obj in (mean1, logvar1, mean2, logvar2):
+        if isinstance(obj, torch.Tensor):
+            tensor = obj
+            break
+    assert tensor is not None, "at least one argument must be a Tensor"
+
+    # Force variances to be Tensors. Broadcasting helps convert scalars to
+    # Tensors, but it does not work for th.exp().
+    logvar1, logvar2 = [
+        x if isinstance(x, torch.Tensor) else torch.tensor(x).to(tensor)
+        for x in (logvar1, logvar2)
+    ]
+
+    return 0.5 * (
+        -1.0
+        + logvar2
+        - logvar1
+        + torch.exp(logvar1 - logvar2)
+        + ((mean1 - mean2) ** 2) * torch.exp(-logvar2)
+    )
+
+def approx_standard_normal_cdf(x):
+    """
+    A fast approximation of the cumulative distribution function of the
+    standard normal.
+    """
+    return 0.5 * (1.0 + torch.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * torch.pow(x, 3))))
+
+def discretized_gaussian_log_likelihood(x, *, means, log_scales):
+    """
+    Compute the log-likelihood of a Gaussian distribution discretizing to a
+    given image.
+    :param x: the target images. It is assumed that this was uint8 values,
+              rescaled to the range [-1, 1].
+    :param means: the Gaussian mean Tensor.
+    :param log_scales: the Gaussian log stddev Tensor.
+    :return: a tensor like x of log probabilities (in nats).
+    """
+    assert x.shape == means.shape == log_scales.shape
+    centered_x = x - means
+    inv_stdv = torch.exp(-log_scales)
+    plus_in = inv_stdv * (centered_x + 1.0 / 255.0)
+    cdf_plus = approx_standard_normal_cdf(plus_in)
+    min_in = inv_stdv * (centered_x - 1.0 / 255.0)
+    cdf_min = approx_standard_normal_cdf(min_in)
+    log_cdf_plus = torch.log(cdf_plus.clamp(min=1e-12))
+    log_one_minus_cdf_min = torch.log((1.0 - cdf_min).clamp(min=1e-12))
+    cdf_delta = cdf_plus - cdf_min
+    log_probs = torch.where(
+        x < -0.999,
+        log_cdf_plus,
+        torch.where(x > 0.999, log_one_minus_cdf_min, torch.log(cdf_delta.clamp(min=1e-12))),
+    )
+    assert log_probs.shape == x.shape
+    return log_probs
+
+
 
 # trainer class
 
@@ -941,7 +1085,7 @@ class Trainer1D(object):
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
-        max_grad_norm = 1.,
+        max_grad_norm = None,
         use_cpu=False,
         dataset_test=None
     ):
@@ -976,7 +1120,7 @@ class Trainer1D(object):
 
         dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 4)
         if dataset_test is not None:
-            self.dl_test = DataLoader(dataset_test, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 4)
+            self.dl_test = DataLoader(dataset_test, batch_size = train_batch_size, shuffle=False, pin_memory=True, num_workers=4, persistent_workers=True)
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
@@ -984,6 +1128,7 @@ class Trainer1D(object):
 
         self.opt = AdamW(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=1e-4, fused=True)
         # cosine annealing lr scheduler
+        # TODO: make this optional
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.train_num_steps, eta_min=1e-6)
 
         # for logging results in a folder periodically
@@ -1064,30 +1209,34 @@ class Trainer1D(object):
 
                 total_loss = 0.
 
-                for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl)#.to(device)
+                # for _ in range(self.gradient_accumulate_every):
+                data = next(self.dl)#.to(device)
+                with accelerator.accumulate(self.model):
                     sequence, classes = data[0].to(device), data[1].to(device)
                     with self.accelerator.autocast():
                         loss = self.model(sequence, classes=classes)
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
+                        # loss = loss / self.gradient_accumulate_every
+                        # total_loss += loss.item()
 
                     self.accelerator.backward(loss)
 
 
-                accelerator.wait_for_everyone()
-                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    # accelerator.wait_for_everyone()
+                    if self.max_grad_norm is not None and accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-                self.opt.step()
-                self.opt.zero_grad()
-                self.scheduler.step()
+                    self.opt.step()
+                    self.opt.zero_grad()
+                    self.scheduler.step()
 
-                accelerator.wait_for_everyone()
+                # accelerator.wait_for_everyone()
 
                 self.step += 1
                 if accelerator.is_main_process:
+                    total_loss += loss.detach().float().mean().cpu().item()
                     self.loss_history.append(total_loss)
                     pbar.set_description(f'loss: {total_loss:.5f}')
+                    pbar.update(1)
                     self.ema.update()
 
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
@@ -1113,26 +1262,31 @@ class Trainer1D(object):
                         self.test_loss_history.append(np.mean(test_losses))
                         torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.pt'))
                         self.save(milestone)
+                        self.save_loss_plot()
 
-                pbar.update(1)
+                
                 
         if accelerator.is_main_process:
-            plt.figure()
-            plt.plot(self.loss_history, label='Loss')
-            if self.test_loss_history:
-                test_x_values = list(range(self.save_and_sample_every, self.train_num_steps+1, self.save_and_sample_every))
-                print(test_x_values, self.test_loss_history)
-                plt.plot(test_x_values, self.test_loss_history, label='Test Loss')    
-            # Compute moving average
-            window_size = 100
-            if len(self.loss_history) >= window_size:
-                moving_avg = np.convolve(self.loss_history, np.ones(window_size)/window_size, mode='valid')
-                plt.plot(range(window_size-1, len(self.loss_history)), moving_avg, label=f'Moving Avg ({window_size})')
-            plt.yscale('log')
-            plt.xlabel('Training Steps')
-            plt.ylabel('Loss (log scale)')
-            plt.title('Training Loss Evolution')
-            plt.legend()
-            plt.savefig(self.results_folder / "loss_evolution.png", bbox_inches="tight", pad_inches=0)
-            plt.close()
+            self.save_loss_plot()
+            
         accelerator.print('training complete')
+    
+    def save_loss_plot(self):
+        plt.figure()
+        plt.plot(self.loss_history, label='Loss')
+        if self.test_loss_history:
+            test_x_values = list(range(self.save_and_sample_every, self.step+1, self.save_and_sample_every))
+            # print(test_x_values, self.test_loss_history)
+            plt.plot(test_x_values, self.test_loss_history, label='Test Loss')    
+        # Compute moving average
+        window_size = 100
+        if len(self.loss_history) >= window_size:
+            moving_avg = np.convolve(self.loss_history, np.ones(window_size)/window_size, mode='valid')
+            plt.plot(range(window_size-1, len(self.loss_history)), moving_avg, label=f'Moving Avg ({window_size})')
+        plt.yscale('log')
+        plt.xlabel('Training Steps')
+        plt.ylabel('Loss (log scale)')
+        plt.title('Training Loss Evolution')
+        plt.legend()
+        plt.savefig(self.results_folder / "loss_evolution.png", bbox_inches="tight", pad_inches=0)
+        plt.close()
