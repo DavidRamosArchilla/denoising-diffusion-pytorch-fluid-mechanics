@@ -259,9 +259,7 @@ class DiT(nn.Module):
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
-        force_drop_ids = None
-        if "force_drop_ids" in kwargs:
-            force_drop_ids = kwargs["force_drop_ids"]
+        force_drop_ids = kwargs["force_drop_ids"] if "force_drop_ids" in kwargs else None
         y = self.y_embedder(y, self.training, force_drop_ids)    # (N, D)
         # TODO: probar a concatenar en vez de sumar (habra que ajustar las dimensiones)
         c = t + y                                # (N, D)
@@ -277,16 +275,18 @@ class DiT(nn.Module):
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         # half = x[: len(x) // 2]
+        batch_size = x.shape[0]
         combined = torch.cat([x, x], dim=0)
         force_drop_ids = torch.cat(
             [
-                torch.zeros_like(y, dtype=torch.bool),
-                torch.ones_like(y, dtype=torch.bool),
+                torch.zeros((batch_size,), dtype=torch.bool, device=x.device),
+                torch.ones((batch_size,), dtype=torch.bool, device=x.device),
             ],
             dim=0,
         )
         y_combined = torch.cat([y, y], dim=0)
-        model_out = self.forward(combined, t, y_combined, force_drop_ids=force_drop_ids)
+        t_combined = torch.cat([t, t], dim=0)
+        model_out = self.forward(combined, t_combined, y_combined, force_drop_ids=force_drop_ids)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
@@ -471,16 +471,18 @@ class DiT1D(nn.Module):
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         # half = x[: len(x) // 2]
+        batch_size = x.shape[0]
         combined = torch.cat([x, x], dim=0)
         force_drop_ids = torch.cat(
             [
-                torch.zeros_like(y, dtype=torch.bool),
-                torch.ones_like(y, dtype=torch.bool),
+                torch.zeros((batch_size,), dtype=torch.bool, device=x.device),
+                torch.ones((batch_size,), dtype=torch.bool, device=x.device),
             ],
             dim=0,
         )
         y_combined = torch.cat([y, y], dim=0)
-        model_out = self.forward(combined, t, y_combined, force_drop_ids=force_drop_ids)
+        t_combined = torch.cat([t, t], dim=0)
+        model_out = self.forward(combined, t_combined, y_combined, force_drop_ids=force_drop_ids)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
@@ -489,7 +491,20 @@ class DiT1D(nn.Module):
         # eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cond_scale * (cond_eps - uncond_eps)
-        return half_eps, uncond_eps
+        # return half_eps, uncond_eps
+        eps = torch.cat([half_eps, uncond_eps], dim=0)
+        eps_sigma = torch.cat([eps, rest], dim=1)
+        # return cfg eps and unconditioned eps
+        return eps_sigma.chunk(2, dim=0)
+
+        # if rescaled_phi == 0.:
+        #     return scaled_logits, null_logits
+
+        # std_fn = partial(torch.std, dim = tuple(range(1, scaled_logits.ndim)), keepdim = True)
+        # rescaled_logits = scaled_logits * (std_fn(logits) / std_fn(scaled_logits))
+        # interpolated_rescaled_logits = rescaled_logits * rescaled_phi + scaled_logits * (1. - rescaled_phi)
+
+        # return interpolated_rescaled_logits, null_logits
 
 
 #################################################################################
@@ -600,6 +615,10 @@ def DiT_S_4(**kwargs):
 def DiT_S_8(**kwargs):
     return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
+
+def DiT1D_XL_1(**kwargs):
+    return DiT1D(depth=28, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
+
 def DiT1D_XL_2(**kwargs):
     return DiT1D(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
@@ -608,6 +627,9 @@ def DiT1D_XL_4(**kwargs):
 
 def DiT1D_XL_8(**kwargs):
     return DiT1D(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+
+def DiT1D_L_1(**kwargs):
+    return DiT1D(depth=24, hidden_size=1024, patch_size=1, num_heads=16, **kwargs)
 
 def DiT1D_L_2(**kwargs):
     return DiT1D(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
@@ -627,6 +649,9 @@ def DiT1D_B_4(**kwargs):
 def DiT1D_B_8(**kwargs):
     return DiT1D(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
 
+def DiT1D_S_1(**kwargs):
+    return DiT1D(depth=12, hidden_size=384, patch_size=1, num_heads=6, **kwargs)
+
 def DiT1D_S_2(**kwargs):
     return DiT1D(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
 
@@ -635,6 +660,18 @@ def DiT1D_S_4(**kwargs):
 
 def DiT1D_S_8(**kwargs):
     return DiT1D(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+
+def DiT1D_XS_1(**kwargs):
+    return DiT1D(depth=8, hidden_size=256, patch_size=1, num_heads=4, **kwargs)
+
+def DiT1D_XS_2(**kwargs):
+    return DiT1D(depth=8, hidden_size=256, patch_size=2, num_heads=4, **kwargs)
+
+def DiT1D_XS_4(**kwargs):
+    return DiT1D(depth=8, hidden_size=256, patch_size=4, num_heads=4, **kwargs)
+
+def DiT1D_XS_8(**kwargs):
+    return DiT1D(depth=8, hidden_size=256, patch_size=8, num_heads=4, **kwargs)
 
 
 DiT_models = {
@@ -646,8 +683,9 @@ DiT_models = {
 
 
 DiT1D_models = {
-    'DiT1D-XL/2': DiT1D_XL_2,  'DiT1D-XL/4': DiT1D_XL_4,  'DiT1D-XL/8': DiT1D_XL_8,
-    'DiT1D-L/2':  DiT1D_L_2,   'DiT1D-L/4':  DiT1D_L_4,   'DiT1D-L/8':  DiT1D_L_8,
+    'DiT1D-XL/1': DiT1D_XL_1,  'DiT1D-XL/2': DiT1D_XL_2,  'DiT1D-XL/4': DiT1D_XL_4,  'DiT1D-XL/8': DiT1D_XL_8,
+    'DiT1D-L/1':  DiT1D_L_1,   'DiT1D-L/2':  DiT1D_L_2,   'DiT1D-L/4':  DiT1D_L_4,   'DiT1D-L/8':  DiT1D_L_8,
     'DiT1D-B/2':  DiT1D_B_2,   'DiT1D-B/4':  DiT1D_B_4,   'DiT1D-B/8':  DiT1D_B_8,
-    'DiT1D-S/2':  DiT1D_S_2,   'DiT1D-S/4':  DiT1D_S_4,   'DiT1D-S/8':  DiT1D_S_8,
+    'DiT1D-S/1':  DiT1D_S_1,  'DiT1D-S/2':  DiT1D_S_2,   'DiT1D-S/4':  DiT1D_S_4,   'DiT1D-S/8':  DiT1D_S_8,
+    'DiT1D-XS/1': DiT1D_XS_1,  'DiT1D-XS/2': DiT1D_XS_2,  'DiT1D-XS/4': DiT1D_XS_4,  'DiT1D-XS/8': DiT1D_XS_8,
 }
