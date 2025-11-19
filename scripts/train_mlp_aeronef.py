@@ -80,9 +80,11 @@ pipeline = pyLOM.NN.Pipeline(
 
 # training_logs = pipeline.run()
 # model.save('./aeronef_mlp_model.pt')
-model = pyLOM.NN.MLP.load('./aeronef_mlp_model.pt')
+model = pyLOM.NN.MLP.load('results/aeronef/mlp_unstruct/aeronef_mlp_model.pt')
 preds = model.predict(dataset_test, batch_size=250)
+preds = (preds * pressure_std) + pressure_mean
 y_true = dataset_test[:][1]
+y_true = (y_true * pressure_std) + pressure_mean
 evaluator = pyLOM.NN.RegressionEvaluator()
 evaluator(y_true, preds)
 evaluator.print_metrics()

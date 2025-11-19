@@ -27,7 +27,7 @@ from cetaceo.evaluators import RegressionEvaluator
 data_dir = "/home/d.ramos/Datos_DLR_pylom"
 
 def load_dataset(name, norm_coefficients):
-    data_train  = pyLOM.Dataset.load(f"{data_dir}/{name}.h5")
+    data_train = pyLOM.Dataset.load(f"{data_dir}/{name}.h5")
     airfoil_coords = torch.tensor(data_train.xyz).float()
     aoa = data_train.get_variable('AoA')
     mach = data_train.get_variable('Mach')
@@ -85,7 +85,7 @@ dataset_test, _ = load_dataset("NRL7301_TEST", norm_coefficients)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = ConditionedGraphUNet(
-    dim=32,
+    dim=64,
     in_channels=4,
     out_channels=1,
     # cond_dim=2,
@@ -93,11 +93,11 @@ model = ConditionedGraphUNet(
     dim_mults=(1, 2, 4, 8),
     pool_ratios=0.5,
     sum_res=False,
-    act=torch.nn.SiLU(),
+    act=torch.nn.GELU(),
 )
 model.to(device)
 
-results_dir = Path("results/dlr/solo_gunet_XL")
+results_dir = Path("results/dlr/solo_gunet_XXL_with_attn")
 os.makedirs(results_dir, exist_ok=True)
 
 training_iters = 60000

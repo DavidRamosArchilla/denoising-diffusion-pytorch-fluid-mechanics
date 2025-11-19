@@ -50,6 +50,7 @@ class AeronefDataset(Dataset):
         mean_in = cond_data.mean(axis=0)
         std_in = cond_data.std(axis=0)
         cond_data = (cond_data - mean_in) / std_in
+        print(cond_data.mean(axis=0), cond_data.std(axis=0))
         self.coef_norm['mean_in'] = mean_in
         self.coef_norm['std_in'] = std_in
         total_points = db['Xcoordinate'].shape[1]
@@ -71,10 +72,11 @@ class AeronefDataset(Dataset):
                 # cond = cond[subsample_indices]
 
             # Create edges using k-nearest neighbors or radius graph
-            edge_index = knn_graph(pos, k=8, batch=None, loop=False)
+            edge_index = knn_graph(pos, k=4, batch=None, loop=False)
             # OR: edge_index = radius_graph(pos, r=0.1, batch=None, loop=False)
             # self.graph_dataset.append(Data(x=x, pos=pos, y=output))#, edge_index=edge_index))
-            input_data = torch.cat([pos, output], dim=1)
+            # input_data = torch.cat([pos, output], dim=1)
+            input_data = output
             self.graph_dataset.append(Data(x=input_data, pos=pos, edge_index=edge_index))
             self.conditions.append(cond) 
     
@@ -106,22 +108,23 @@ class AeronefDataset(Dataset):
         return len(self.graph_dataset)
 
 data_directory = 'data/aeronef/'
-train_dataset_obj = AeronefDataset(data_directory, "Pressure", num_points=10000)
+train_dataset_obj = AeronefDataset(data_directory, "Pressure", num_points=1000)
 train_dataset_obj.create_splits(train_ratio=0.8, val_ratio=0.2, test_ratio=1e9, seed=42)
 
 example_graph = train_dataset_obj.graph_dataset[100]
 print(example_graph)
 model = ConditionedGraphUNet(
-    dim=32,
-    in_channels=3,
-    out_channels=3,
+    dim=64,
+    in_channels=1,
+    out_channels=1,
     cond_dim=2,
     cond_drop_prob=0.0,
     dim_mults=(1, 2, 4),
     pool_ratios=0.5,
     sum_res=False,
-    act='relu',
+    act=torch.nn.GELU(),
 )
+print(example_graph.x.shape)
 
 diffusion = GraphDiffusion(
     model,
@@ -131,12 +134,12 @@ diffusion = GraphDiffusion(
     beta_schedule="cosine",
     sampling_timesteps=1000,
     timesteps=1000,  # number of steps
-    min_snr_loss_weight=True,
-    min_snr_gamma=5,
+    # min_snr_loss_weight=True,
+    # min_snr_gamma=5,
 )
 
-results_folder = 'results/aeronef/gunet_M'
-train_steps = 100000
+results_folder = 'results/aeronef/gunet_L'
+train_steps = 10000
 
 trainer = Trainer(
     diffusion,
@@ -149,7 +152,7 @@ trainer = Trainer(
     ema_decay=0.995,  # exponential moving average decay
     # amp = True,                       # turn on mixed precision
     results_folder=results_folder,  # folder to save results to
-    save_and_sample_every=10000,
+    save_and_sample_every=12000,
     # use_cpu=True
 )
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))

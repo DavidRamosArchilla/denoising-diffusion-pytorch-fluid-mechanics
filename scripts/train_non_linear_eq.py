@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from torch.utils.data import TensorDataset
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance import Unet, GaussianDiffusion, Trainer, evaluate_model
+from denoising_diffusion_pytorch.karras_unet import KarrasUnet
 import shutil
 import os
 import matplotlib.pyplot as plt
@@ -11,15 +12,15 @@ if torch.cuda.is_available():
 
 
 
-# data = np.load("data/non_linear_eq/non_linear_train_solutions.npy")
-data = np.load("data/non_linear_eq_latents/train_latents.npy") 
+data = np.load("data/non_linear_eq/non_linear_train_solutions.npy")
+# data = np.load("data/non_linear_eq_latents/train_latents.npy") 
 # at the moment the model expects inputs in [0, 1], like grayscale images 
 data_min, data_max = data.min(), data.max()
 data = (data - data_min) / (data_max - data_min)  # scale to [0, 1]
-# data = data[:, np.newaxis, :, :]  # add channel dimension   
+data = data[:, np.newaxis, :, :]  # add channel dimension   
 print(data.shape)
-# parameters = np.load("data/non_linear_eq/non_linear_train_parameters.npy")
-parameters = np.load("data/non_linear_eq_latents/train_parameters.npy") 
+parameters = np.load("data/non_linear_eq/non_linear_train_parameters.npy")
+# parameters = np.load("data/non_linear_eq_latents/train_parameters.npy") 
 # normalize parameters to [0, 1]
 parameters_mean, parameters_std = parameters.mean(axis=0), parameters.std(axis=0)
 parameters = (parameters - parameters_mean) / (parameters_std)
@@ -41,18 +42,29 @@ extrapolation_parameters = (extrapolation_parameters - parameters_mean) / (param
 dataset = TensorDataset(torch.tensor(data, dtype=torch.float32), torch.tensor(parameters, dtype=torch.float32))
 test_dataset = TensorDataset(torch.tensor(test_data, dtype=torch.float32), torch.tensor(test_parameters, dtype=torch.float32))
 
-model = Unet(
-    dim = 128,
-    dim_mults = (1, 2, 4),#, 8),
+# model = Unet(
+#     dim = 128,
+#     dim_mults = (1, 2, 4),#, 8),
+#     # flash_attn = False,
+#     channels = 4, # 4 for the latent representations
+#     cond_dim=2,
+#     # full_attn = False
+# )
+
+model = KarrasUnet(
+    image_size=64,
+    dim=64,
+    # dim_mults=(1, 2, 4),  # , 8),
     # flash_attn = False,
-    channels = 4, # 4 for the latent representations
-    cond_dim=2,
+    channels=1,  
+    num_classes=2,
+    self_condition=True,
     # full_attn = False
 )
 
 diffusion = GaussianDiffusion(
     model,
-    image_size = (256, 256),
+    image_size = (64, 64),
     objective = 'pred_noise',  # 'pred_noise' or 'pred_x0'
     beta_schedule="cosine",
     sampling_timesteps=1000,
@@ -64,7 +76,7 @@ print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 1e9} GB")
 
-results_folder = 'results/non_linear_eq_big_latent'
+results_folder = 'results/non_linear_eq_big_karras'
 
 trainer = Trainer(
     diffusion,
@@ -96,8 +108,8 @@ diffusion.eval()
 
 errors, samples = evaluate_model(
     diffusion, # trainer.ema.ema_model, #
-    parameters[:50],
-    data[:50],
+    test_parameters,
+    test_data,
     128,
     cond_scale=6
 )
@@ -119,15 +131,15 @@ inputs_to_plot = (extrapolation_parameters[:num_images] * parameters_std) - para
 real_values_to_plot = extrapolation_data[:num_images]
 predictions_to_plot = diffusion.sample(torch.tensor(inputs_to_plot, dtype=torch.float32).to(model_device)).cpu().numpy()
 
-# plot_images_grid(
-#     predictions_to_plot,
-#     inputs_to_plot,
-#     f"{results_folder}/extrapolation_predictions.png"
-# )
+plot_images_grid(
+    predictions_to_plot,
+    inputs_to_plot,
+    f"{results_folder}/extrapolation_predictions.png"
+)
 
-# plot_images_grid(
-#     real_values_to_plot,
-#     inputs_to_plot,
-#     f"{results_folder}/extrapolation_true_values.png"
-# )
+plot_images_grid(
+    real_values_to_plot,
+    inputs_to_plot,
+    f"{results_folder}/extrapolation_true_values.png"
+)
 plt.close()
