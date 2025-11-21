@@ -115,9 +115,9 @@ class DiTBlock(nn.Module):
     """
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm1 = nn.RMSNorm(hidden_size) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.RMSNorm(hidden_size) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
@@ -139,7 +139,7 @@ class FinalLayer(nn.Module):
     """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_final = nn.RMSNorm(hidden_size) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -257,7 +257,7 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2, i.e, num_patches
         t = self.t_embedder(t)                   # (N, D)
         force_drop_ids = kwargs["force_drop_ids"] if "force_drop_ids" in kwargs else None
         y = self.y_embedder(y, self.training, force_drop_ids)    # (N, D)
@@ -336,7 +336,7 @@ class FinalLayer1D(nn.Module):
     """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_final = nn.RMSNorm(hidden_size) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -640,6 +640,9 @@ def DiT1D_L_4(**kwargs):
 def DiT1D_L_8(**kwargs):
     return DiT1D(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
+def DiT1D_B_1(**kwargs):
+    return DiT1D(depth=12, hidden_size=768, patch_size=1, num_heads=12, **kwargs)
+
 def DiT1D_B_2(**kwargs):
     return DiT1D(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
@@ -685,7 +688,7 @@ DiT_models = {
 DiT1D_models = {
     'DiT1D-XL/1': DiT1D_XL_1,  'DiT1D-XL/2': DiT1D_XL_2,  'DiT1D-XL/4': DiT1D_XL_4,  'DiT1D-XL/8': DiT1D_XL_8,
     'DiT1D-L/1':  DiT1D_L_1,   'DiT1D-L/2':  DiT1D_L_2,   'DiT1D-L/4':  DiT1D_L_4,   'DiT1D-L/8':  DiT1D_L_8,
-    'DiT1D-B/2':  DiT1D_B_2,   'DiT1D-B/4':  DiT1D_B_4,   'DiT1D-B/8':  DiT1D_B_8,
-    'DiT1D-S/1':  DiT1D_S_1,  'DiT1D-S/2':  DiT1D_S_2,   'DiT1D-S/4':  DiT1D_S_4,   'DiT1D-S/8':  DiT1D_S_8,
+    'DiT1D-B/1':  DiT1D_B_1,   'DiT1D-B/2':  DiT1D_B_2,   'DiT1D-B/4':  DiT1D_B_4,   'DiT1D-B/8':  DiT1D_B_8,
+    'DiT1D-S/1':  DiT1D_S_1,   'DiT1D-S/2':  DiT1D_S_2,   'DiT1D-S/4':  DiT1D_S_4,   'DiT1D-S/8':  DiT1D_S_8,
     'DiT1D-XS/1': DiT1D_XS_1,  'DiT1D-XS/2': DiT1D_XS_2,  'DiT1D-XS/4': DiT1D_XS_4,  'DiT1D-XS/8': DiT1D_XS_8,
 }
