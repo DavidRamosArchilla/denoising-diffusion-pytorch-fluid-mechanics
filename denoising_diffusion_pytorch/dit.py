@@ -152,163 +152,6 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
-
-class DiT(nn.Module):
-    """
-    Diffusion model with a Transformer backbone.
-    """
-    def __init__(
-        self,
-        input_size=32,
-        patch_size=2,
-        in_channels=4,
-        hidden_size=1152,
-        depth=28,
-        num_heads=16,
-        mlp_ratio=4.0,
-        class_dropout_prob=0.1,
-        cond_dim=2,
-        learn_sigma=True,
-    ):
-        super().__init__()
-        self.learn_sigma = learn_sigma
-        self.channels = in_channels
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
-        self.patch_size = patch_size
-        self.num_heads = num_heads
-        self.cond_dim = cond_dim
-
-        self.self_condition = False  # Not used in DiT, this is here for interface compatibility
-
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = ConditionEmbedder(cond_dim, hidden_size, class_dropout_prob)
-        num_patches = self.x_embedder.num_patches
-        # Will use fixed sin-cos embedding:
-        print(f"Creating DiT with {num_patches} patches.")
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
-
-        self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
-        ])
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        # Initialize transformer layers:
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-        self.apply(_basic_init)
-
-        # Initialize (and freeze) pos_embed by sin-cos embedding:
-        h = self.x_embedder.img_size[0] // self.x_embedder.patch_size[0]
-        w = self.x_embedder.img_size[1] // self.x_embedder.patch_size[1]
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], (h, w))
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
-
-        # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.y_embedder.mlp[2].weight, std=0.02)
-
-        # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
-        # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-        # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
-
-    def unpatchify(self, x):
-        """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C) (or is it (N, C, H, W)?)
-        """
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        # h = w = int(x.shape[1] ** 0.5)
-        h = self.x_embedder.img_size[0] // p
-        w = self.x_embedder.img_size[1] // p
-        assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('n h w p q c->n c h p w q', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
-        return imgs
-
-    def forward(self, x, t, y, *args, **kwargs):
-        """
-        Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
-        """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2, i.e, num_patches
-        t = self.t_embedder(t)                   # (N, D)
-        force_drop_ids = kwargs["force_drop_ids"] if "force_drop_ids" in kwargs else None
-        y = self.y_embedder(y, self.training, force_drop_ids)    # (N, D)
-        # TODO: probar a concatenar en vez de sumar (habra que ajustar las dimensiones)
-        c = t + y                                # (N, D)
-        for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
-        x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)                   # (N, out_channels, H, W)
-        return x
-
-    def forward_with_cond_scale(self, x, t, y, cond_scale, *args, **kwargs):
-        """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        # half = x[: len(x) // 2]
-        batch_size = x.shape[0]
-        combined = torch.cat([x, x], dim=0)
-        force_drop_ids = torch.cat(
-            [
-                torch.zeros((batch_size,), dtype=torch.bool, device=x.device),
-                torch.ones((batch_size,), dtype=torch.bool, device=x.device),
-            ],
-            dim=0,
-        )
-        y_combined = torch.cat([y, y], dim=0)
-        t_combined = torch.cat([t, t], dim=0)
-        model_out = self.forward(combined, t_combined, y_combined, force_drop_ids=force_drop_ids)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # separate noise predictions and from variance predictions if present
-        eps, rest = model_out[:, :self.channels], model_out[:, self.channels:]
-        # eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cond_scale * (cond_eps - uncond_eps)
-        return half_eps, uncond_eps
-        # eps = torch.cat([half_eps, uncond_eps], dim=0)
-        # return torch.cat([eps, rest], dim=1)
-
-        # if rescaled_phi == 0.:
-        #     return scaled_logits, null_logits
-
-        # std_fn = partial(torch.std, dim = tuple(range(1, scaled_logits.ndim)), keepdim = True)
-        # rescaled_logits = scaled_logits * (std_fn(logits) / std_fn(scaled_logits))
-        # interpolated_rescaled_logits = rescaled_logits * rescaled_phi + scaled_logits * (1. - rescaled_phi)
-
-        # return interpolated_rescaled_logits, null_logits
-
-
 #################################################################################
 #                                     1D DiT                                    #
 #################################################################################
@@ -350,13 +193,13 @@ class FinalLayer1D(nn.Module):
         return x
 
 
-class DiT1D(nn.Module):
+class DiT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
     """
     def __init__(
         self,
-        seq_len=1024,        # Instead of input_size
+        input_size=1024,        
         patch_size=16,       # Patch size along sequence
         in_channels=1,
         cond_dim=2,
@@ -377,8 +220,16 @@ class DiT1D(nn.Module):
         self.cond_dim = cond_dim
 
         self.self_condition = False  # Not used in DiT, this is here for interface compatibility
+        if isinstance(input_size, int):
+            self.x_embedder = PatchEmbed1D(input_size, patch_size, in_channels, hidden_size)
+            self.final_layer = FinalLayer1D(hidden_size, patch_size, self.out_channels)
+            print("Creating 1D DiT")
+        else:
+            assert isinstance(input_size, tuple) and len(input_size) == 2
+            self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+            self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+            print("Creating 2D DiT")
 
-        self.x_embedder = PatchEmbed1D(seq_len, patch_size, in_channels, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = ConditionEmbedder(cond_dim, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
@@ -389,7 +240,6 @@ class DiT1D(nn.Module):
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer1D(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -579,6 +429,9 @@ def get_1d_sincos_pos_embed(embed_dim, length):
 #                                   DiT Configs                                  #
 #################################################################################
 
+def DiT_XL_1(**kwargs):
+    return DiT(depth=28, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
+
 def DiT_XL_2(**kwargs):
     return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
@@ -587,6 +440,9 @@ def DiT_XL_4(**kwargs):
 
 def DiT_XL_8(**kwargs):
     return DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+
+def DiT_L_1(**kwargs):
+    return DiT(depth=24, hidden_size=1024, patch_size=1, num_heads=16, **kwargs)
 
 def DiT_L_2(**kwargs):
     return DiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
@@ -597,6 +453,9 @@ def DiT_L_4(**kwargs):
 def DiT_L_8(**kwargs):
     return DiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
+def DiT_B_1(**kwargs):
+    return DiT(depth=12, hidden_size=768, patch_size=1, num_heads=12, **kwargs)
+
 def DiT_B_2(**kwargs):
     return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
@@ -605,6 +464,9 @@ def DiT_B_4(**kwargs):
 
 def DiT_B_8(**kwargs):
     return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
+
+def DiT_S_1(**kwargs):
+    return DiT(depth=12, hidden_size=384, patch_size=1, num_heads=6, **kwargs)
 
 def DiT_S_2(**kwargs):
     return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
@@ -615,80 +477,23 @@ def DiT_S_4(**kwargs):
 def DiT_S_8(**kwargs):
     return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
+def DiT_XS_1(**kwargs):
+    return DiT(depth=8, hidden_size=256, patch_size=1, num_heads=4, **kwargs)
 
-def DiT1D_XL_1(**kwargs):
-    return DiT1D(depth=28, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
+def DiT_XS_2(**kwargs):
+    return DiT(depth=8, hidden_size=256, patch_size=2, num_heads=4, **kwargs)
 
-def DiT1D_XL_2(**kwargs):
-    return DiT1D(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+def DiT_XS_4(**kwargs):
+    return DiT(depth=8, hidden_size=256, patch_size=4, num_heads=4, **kwargs)
 
-def DiT1D_XL_4(**kwargs):
-    return DiT1D(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
-
-def DiT1D_XL_8(**kwargs):
-    return DiT1D(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
-
-def DiT1D_L_1(**kwargs):
-    return DiT1D(depth=24, hidden_size=1024, patch_size=1, num_heads=16, **kwargs)
-
-def DiT1D_L_2(**kwargs):
-    return DiT1D(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
-
-def DiT1D_L_4(**kwargs):
-    return DiT1D(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
-
-def DiT1D_L_8(**kwargs):
-    return DiT1D(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
-
-def DiT1D_B_1(**kwargs):
-    return DiT1D(depth=12, hidden_size=768, patch_size=1, num_heads=12, **kwargs)
-
-def DiT1D_B_2(**kwargs):
-    return DiT1D(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
-
-def DiT1D_B_4(**kwargs):
-    return DiT1D(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
-
-def DiT1D_B_8(**kwargs):
-    return DiT1D(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
-
-def DiT1D_S_1(**kwargs):
-    return DiT1D(depth=12, hidden_size=384, patch_size=1, num_heads=6, **kwargs)
-
-def DiT1D_S_2(**kwargs):
-    return DiT1D(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
-
-def DiT1D_S_4(**kwargs):
-    return DiT1D(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
-
-def DiT1D_S_8(**kwargs):
-    return DiT1D(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
-
-def DiT1D_XS_1(**kwargs):
-    return DiT1D(depth=8, hidden_size=256, patch_size=1, num_heads=4, **kwargs)
-
-def DiT1D_XS_2(**kwargs):
-    return DiT1D(depth=8, hidden_size=256, patch_size=2, num_heads=4, **kwargs)
-
-def DiT1D_XS_4(**kwargs):
-    return DiT1D(depth=8, hidden_size=256, patch_size=4, num_heads=4, **kwargs)
-
-def DiT1D_XS_8(**kwargs):
-    return DiT1D(depth=8, hidden_size=256, patch_size=8, num_heads=4, **kwargs)
+def DiT_XS_8(**kwargs):
+    return DiT(depth=8, hidden_size=256, patch_size=8, num_heads=4, **kwargs)
 
 
 DiT_models = {
-    'DiT-XL/2': DiT_XL_2,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
-    'DiT-L/2':  DiT_L_2,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
-    'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
-    'DiT-S/2':  DiT_S_2,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
-}
-
-
-DiT1D_models = {
-    'DiT1D-XL/1': DiT1D_XL_1,  'DiT1D-XL/2': DiT1D_XL_2,  'DiT1D-XL/4': DiT1D_XL_4,  'DiT1D-XL/8': DiT1D_XL_8,
-    'DiT1D-L/1':  DiT1D_L_1,   'DiT1D-L/2':  DiT1D_L_2,   'DiT1D-L/4':  DiT1D_L_4,   'DiT1D-L/8':  DiT1D_L_8,
-    'DiT1D-B/1':  DiT1D_B_1,   'DiT1D-B/2':  DiT1D_B_2,   'DiT1D-B/4':  DiT1D_B_4,   'DiT1D-B/8':  DiT1D_B_8,
-    'DiT1D-S/1':  DiT1D_S_1,   'DiT1D-S/2':  DiT1D_S_2,   'DiT1D-S/4':  DiT1D_S_4,   'DiT1D-S/8':  DiT1D_S_8,
-    'DiT1D-XS/1': DiT1D_XS_1,  'DiT1D-XS/2': DiT1D_XS_2,  'DiT1D-XS/4': DiT1D_XS_4,  'DiT1D-XS/8': DiT1D_XS_8,
+    'DiT-XL/2': DiT_XL_2,  'DiT-XL/1': DiT_XL_1,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
+    'DiT-L/2':  DiT_L_2,   'DiT-L/1':  DiT_L_1,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
+    'DiT-B/2':  DiT_B_2,   'DiT-B/1':  DiT_B_1,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
+    'DiT-S/2':  DiT_S_2,   'DiT-S/1':  DiT_S_1,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
+    'DiT-XS/1': DiT_XS_1,  'DiT-XS/2': DiT_XS_2,  'DiT-XS/4': DiT_XS_4,  'DiT-XS/8': DiT_XS_8,
 }
