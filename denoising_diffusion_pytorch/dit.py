@@ -12,6 +12,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import repeat, rearrange
 import numpy as np
 import math
@@ -30,12 +31,12 @@ class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
     """
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+    def __init__(self, hidden_size, frequency_embedding_size=256, bias=True):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.Linear(frequency_embedding_size, hidden_size, bias=bias),
             nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            nn.Linear(hidden_size, hidden_size, bias=bias),
         )
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -109,21 +110,47 @@ class ConditionEmbedder(nn.Module):
 #                                 Core DiT Model                                #
 #################################################################################
 
+# borrowed from LightningDiT https://github.com/hustvl/LightningDiT/blob/main/models/swiglu_ffn.py
+class SwiGLUFFN(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features=None,
+        out_features=None,
+        bias=True,
+    ) -> None:
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.w12 = nn.Linear(in_features, 2 * hidden_features, bias=bias)
+        self.w3 = nn.Linear(hidden_features, out_features, bias=bias)
+
+    @torch.compile
+    def forward(self, x):
+        x12 = self.w12(x)
+        x1, x2 = x12.chunk(2, dim=-1)
+        hidden = F.silu(x1) * x2
+        return self.w3(hidden)
+
+
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, bias=True, use_swiglu=False, **block_kwargs):
         super().__init__()
-        self.norm1 = nn.RMSNorm(hidden_size) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm2 = nn.RMSNorm(hidden_size) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm1 = nn.RMSNorm(hidden_size, elementwise_affine=bias) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias,**block_kwargs)
+        self.norm2 = nn.RMSNorm(hidden_size, elementwise_affine=bias) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        if use_swiglu:
+            self.mlp = SwiGLUFFN(hidden_size, int(2/3 * mlp_hidden_dim), bias=bias)
+        else:
+            self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0, bias=bias)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            nn.Linear(hidden_size, 6 * hidden_size, bias=bias)
         )
 
     def forward(self, x, c):
@@ -137,13 +164,13 @@ class FinalLayer(nn.Module):
     """
     The final layer of DiT.
     """
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, bias=True):
         super().__init__()
-        self.norm_final = nn.RMSNorm(hidden_size) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.norm_final = nn.RMSNorm(hidden_size, elementwise_affine=bias) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=bias)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            nn.Linear(hidden_size, 2 * hidden_size, bias=bias)
         )
 
     def forward(self, x, c):
@@ -163,9 +190,9 @@ class PatchEmbed1D(nn.Module):
         self.seq_len = seq_len
         self.patch_size = patch_size
         self.num_patches = seq_len // patch_size
-        self.proj = nn.Conv1d(in_channels, embed_dim, 
-                              kernel_size=patch_size, 
-                              stride=patch_size)
+        self.proj = nn.Conv1d(
+            in_channels, embed_dim, kernel_size=patch_size, stride=patch_size
+        )
     
     def forward(self, x):
         # x: (B, C, S)
@@ -177,13 +204,13 @@ class FinalLayer1D(nn.Module):
     """
     The final layer of DiT.
     """
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, bias=True):
         super().__init__()
-        self.norm_final = nn.RMSNorm(hidden_size) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * out_channels, bias=True)
+        self.norm_final = nn.RMSNorm(hidden_size, elementwise_affine=bias) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, patch_size * out_channels, bias=bias)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            nn.Linear(hidden_size, 2 * hidden_size, bias=bias)
         )
 
     def forward(self, x, c):
@@ -191,7 +218,7 @@ class FinalLayer1D(nn.Module):
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
-
+    
 
 class DiT(nn.Module):
     """
@@ -209,6 +236,8 @@ class DiT(nn.Module):
         num_heads=8,
         mlp_ratio=4.0,
         learn_sigma=True,
+        use_bias=True, # this is to use muon
+        use_swiglu=False,
         **kwargs
     ):
         super().__init__()
@@ -222,15 +251,15 @@ class DiT(nn.Module):
         self.self_condition = False  # Not used in DiT, this is here for interface compatibility
         if isinstance(input_size, int):
             self.x_embedder = PatchEmbed1D(input_size, patch_size, in_channels, hidden_size)
-            self.final_layer = FinalLayer1D(hidden_size, patch_size, self.out_channels)
+            self.final_layer = FinalLayer1D(hidden_size, patch_size, self.out_channels, bias=use_bias)
             print("Creating 1D DiT")
         else:
             assert isinstance(input_size, tuple) and len(input_size) == 2
-            self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-            self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+            self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size)
+            self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, bias=use_bias)
             print("Creating 2D DiT")
 
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.t_embedder = TimestepEmbedder(hidden_size, bias=use_bias)
         self.y_embedder = ConditionEmbedder(cond_dim, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
@@ -238,7 +267,7 @@ class DiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, bias=use_bias, use_swiglu=use_swiglu) for _ in range(depth)
         ])
         self.initialize_weights()
 
@@ -261,7 +290,7 @@ class DiT(nn.Module):
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
+        # nn.init.constant_(self.x_embedder.proj.bias, 0)
 
         # Initialize label embedding table:
         nn.init.normal_(self.y_embedder.mlp[0].weight, std=0.02)
@@ -274,13 +303,13 @@ class DiT(nn.Module):
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            # nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        # nn.init.constant_(self.final_layer.linear.bias, 0)
 
     
     def unpatchify(self, x):
@@ -344,9 +373,8 @@ class DiT(nn.Module):
         # return half_eps, uncond_eps
         eps = torch.cat([half_eps, uncond_eps], dim=0)
         eps_sigma = torch.cat([eps, rest], dim=1)
-        # return cfg eps and unconditioned eps
-        return eps_sigma.chunk(2, dim=0)
-
+        # # return cfg eps and unconditioned eps
+        return eps_sigma.chunk(2, dim=0)[0]
         # if rescaled_phi == 0.:
         #     return scaled_logits, null_logits
 

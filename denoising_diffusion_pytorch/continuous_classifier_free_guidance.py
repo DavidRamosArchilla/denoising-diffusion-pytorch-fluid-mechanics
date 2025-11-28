@@ -417,13 +417,13 @@ class Unet(nn.Module):
         scaled_logits = logits + update * (cond_scale - 1.)
 
         if rescaled_phi == 0.:
-            return scaled_logits, null_logits
+            return scaled_logits
 
         std_fn = partial(torch.std, dim = tuple(range(1, scaled_logits.ndim)), keepdim = True)
         rescaled_logits = scaled_logits * (std_fn(logits) / std_fn(scaled_logits))
         interpolated_rescaled_logits = rescaled_logits * rescaled_phi + scaled_logits * (1. - rescaled_phi)
 
-        return interpolated_rescaled_logits, null_logits
+        return interpolated_rescaled_logits
 
     def forward(
         self,
@@ -553,7 +553,7 @@ class GaussianDiffusion(nn.Module):
         use_cfg_plus_plus = False # https://arxiv.org/pdf/2406.08070
     ):
         super().__init__()
-        assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
+        # assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
         # assert not model.random_or_learned_sinusoidal_cond
 
         self.model = model
@@ -687,11 +687,11 @@ class GaussianDiffusion(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def model_predictions(self, x, t, classes, x_self_cond=None, cond_scale = 6., rescaled_phi = 0.7, clip_x_start = False):
-        model_output, model_output_null = self.model.forward_with_cond_scale(x, t, classes, x_self_cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi)
+        model_output = self.model.forward_with_cond_scale(x, t, classes, x_self_cond=x_self_cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
-            pred_noise = model_output if not self.use_cfg_plus_plus else model_output_null
+            pred_noise = model_output #if not self.use_cfg_plus_plus else model_output_null
 
             x_start = self.predict_start_from_noise(x, t, model_output)
             x_start = maybe_clip(x_start)
@@ -699,7 +699,7 @@ class GaussianDiffusion(nn.Module):
         elif self.objective == 'pred_x0':
             x_start = model_output
             x_start = maybe_clip(x_start)
-            x_start_for_pred_noise = x_start if not self.use_cfg_plus_plus else maybe_clip(model_output_null)
+            x_start_for_pred_noise = x_start #if not self.use_cfg_plus_plus else maybe_clip(model_output_null)
 
             pred_noise = self.predict_noise_from_start(x, t, x_start_for_pred_noise)
 
@@ -709,14 +709,15 @@ class GaussianDiffusion(nn.Module):
             x_start = maybe_clip(x_start)
 
             x_start_for_pred_noise = x_start
-            if self.use_cfg_plus_plus:
-                x_start_for_pred_noise = self.predict_start_from_v(x, t, model_output_null)
-                x_start_for_pred_noise = maybe_clip(x_start_for_pred_noise)
+            # if self.use_cfg_plus_plus:
+            #     x_start_for_pred_noise = self.predict_start_from_v(x, t, model_output_null)
+            #     x_start_for_pred_noise = maybe_clip(x_start_for_pred_noise)
 
             pred_noise = self.predict_noise_from_start(x, t, x_start_for_pred_noise)
 
         return ModelPrediction(pred_noise, x_start)
 
+    # TODO: adaptar esto para que se pueda usar learned variance
     def p_mean_variance(self, x, t, classes, cond_scale, rescaled_phi, x_self_cond=None, clip_denoised = True):
         preds = self.model_predictions(x, t, classes, x_self_cond, cond_scale, rescaled_phi)
         x_start = preds.pred_x_start
@@ -1068,7 +1069,6 @@ class Trainer:
                 data = next(self.dl)#.to(device)
                 with accelerator.accumulate(self.model):
                     imgs, classes = data[0].to(device), data[1].to(device)
-
                     with self.accelerator.autocast():
                         loss = self.model(imgs, classes=classes)
                         # loss = loss / self.gradient_accumulate_every
@@ -1124,23 +1124,27 @@ class Trainer:
                         # whether to calculate fid
                         milestone = self.step // self.save_and_sample_every
                         self.save(milestone)
+                        self.save_loss_plot()
                 
         if accelerator.is_main_process:
-            plt.figure()
-            plt.plot(self.all_losses, label='Loss')
-            # Compute moving average
-            window_size = 100
-            if len(self.all_losses) >= window_size:
-                moving_avg = np.convolve(self.all_losses, np.ones(window_size)/window_size, mode='valid')
-                plt.plot(range(window_size-1, len(self.all_losses)), moving_avg, label=f'Moving Avg ({window_size})')
-            plt.yscale('log')
-            plt.xlabel('Training Steps')
-            plt.ylabel('Loss (log scale)')
-            plt.title('Training Loss Evolution')
-            plt.legend()
-            plt.savefig(self.results_folder / "loss_evolution.png", bbox_inches="tight", pad_inches=0)
-            plt.close()
+            self.save_loss_plot()
         accelerator.print('training complete')
+    
+    def save_loss_plot(self):
+        plt.figure()
+        plt.plot(self.all_losses, label='Loss')
+        # Compute moving average
+        window_size = 100
+        if len(self.all_losses) >= window_size:
+            moving_avg = np.convolve(self.all_losses, np.ones(window_size)/window_size, mode='valid')
+            plt.plot(range(window_size-1, len(self.all_losses)), moving_avg, label=f'Moving Avg ({window_size})')
+        plt.yscale('log')
+        plt.xlabel('Training Steps')
+        plt.ylabel('Loss (log scale)')
+        plt.title('Training Loss Evolution')
+        plt.legend()
+        plt.savefig(self.results_folder / "loss_evolution.png", bbox_inches="tight", pad_inches=0)
+        plt.close()
 
 
 def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_size, cond_scale=6, sampler="ddpm"):

@@ -25,6 +25,9 @@ from tqdm.auto import tqdm
 
 from denoising_diffusion_pytorch.version import __version__
 
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True  
+
 # constants
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start', 'pred_variance'])
@@ -290,14 +293,16 @@ class Attention(Module):
         b, c, n = x.shape
         qkv = self.to_qkv(x).chunk(3, dim = 1)
         q, k, v = map(lambda t: rearrange(t, 'b (h c) n -> b h c n', h = self.heads), qkv)
+        out = F.scaled_dot_product_attention(q, k, v) # this outputs (b, h, c, n)
+        out = rearrange(out, 'b h c n-> b (h c) n')
 
-        q = q * self.scale
-
-        sim = einsum('b h d i, b h d j -> b h i j', q, k)
-        attn = sim.softmax(dim = -1)
-        out = einsum('b h i j, b h d j -> b h i d', attn, v)
-
-        out = rearrange(out, 'b h n d -> b (h d) n')
+        # replace this with flash attention
+        # q = q * self.scale
+        # sim = einsum('b h d i, b h d j -> b h i j', q, k)
+        # attn = sim.softmax(dim = -1)
+        # out = einsum('b h i j, b h d j -> b h i d', attn, v)
+        # out = rearrange(out, 'b h n d -> b (h d) n')
+        # print(out.shape)
         return self.to_out(out)
 
 class CrossAttention(nn.Module):
@@ -474,13 +479,13 @@ class Unet1D(Module):
         scaled_logits = logits + update * (cond_scale - 1.)
 
         if rescaled_phi == 0.:
-            return scaled_logits, null_logits
+            return scaled_logits
 
         std_fn = partial(torch.std, dim = tuple(range(1, scaled_logits.ndim)), keepdim = True)
         rescaled_logits = scaled_logits * (std_fn(logits) / std_fn(scaled_logits))
         interpolated_rescaled_logits = rescaled_logits * rescaled_phi + scaled_logits * (1. - rescaled_phi)
 
-        return interpolated_rescaled_logits, null_logits
+        return interpolated_rescaled_logits
 
     def forward(self, x, time, classes, x_self_cond = None, cond_drop_prob=None):
 
@@ -717,7 +722,7 @@ class GaussianDiffusion1D(Module):
 
     def model_predictions(self, x, t, classes, x_self_cond=None, clip_x_start = False, cond_scale = 6., rescaled_phi = 0.7, rederive_pred_noise = False):
         # model_output_null will be useful if i want to add cfg++ (i think)
-        model_output, model_output_null = self.model.forward_with_cond_scale(x, t, classes, x_self_cond=x_self_cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi)
+        model_output = self.model.forward_with_cond_scale(x, t, classes, x_self_cond=x_self_cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
         learned_var = None
         if self.model.learn_sigma:
@@ -754,8 +759,8 @@ class GaussianDiffusion1D(Module):
             x_start.clamp_(-1., 1.)
         if preds.pred_variance is not None:
             model_mean, _, _ = self.q_posterior(x_start=x_start, x_t=x, t=t)
-            min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
-            max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
+            min_log = extract(self.posterior_log_variance_clipped, t, x.shape)
+            max_log = extract(torch.log(self.betas), t, x.shape)
             # The predicted variance is [-1, 1] for [min_var, max_var].
             frac = (preds.pred_variance + 1) / 2
             # interpolation in log space between min and max log variance
@@ -923,6 +928,8 @@ class GaussianDiffusion1D(Module):
                 t=t,
                 clip_denoised=False,
             )
+            # scale this as openai say on the paper --> https://arxiv.org/pdf/2102.09672 sec 3.1
+            var_loss = var_loss # * 0.001
 
         if self.objective == 'pred_noise':
             target = noise
@@ -1087,7 +1094,9 @@ class Trainer1D(object):
         split_batches = True,
         max_grad_norm = None,
         use_cpu=False,
-        dataset_test=None
+        dataset_test=None,
+        use_lr_scheduler=True,
+        use_muon=False
     ):
         super().__init__()
 
@@ -1118,18 +1127,30 @@ class Trainer1D(object):
 
         # dataset and dataloader
 
-        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 4)
+        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle=True, pin_memory=True, num_workers=4, persistent_workers=True)
         if dataset_test is not None:
             self.dl_test = DataLoader(dataset_test, batch_size = train_batch_size, shuffle=False, pin_memory=True, num_workers=4, persistent_workers=True)
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
         # optimizer
-
+        # if use_muon:
+        #     neural_net = diffusion_model.model
+        #     muon_paramaters = list(neural_net.blocks.parameters()) + list(neural_net.t_embedder.parameters()) + list(neural_net.final_layer.parameters())
+        #     adam_parameters = list(neural_net.x_embedder.parameters()) + list(neural_net.y_embedder.parameters())
+        #     self.opts = [torch.optim.Muon(muon_paramaters, lr=train_lr, weight_decay=1e-3), AdamW(adam_parameters, lr=train_lr, betas=adam_betas, weight_decay=1e-4, fused=True)]
+        # else:
+        #     self.opts = [AdamW(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=1e-4, fused=True)]
+        
         self.opt = AdamW(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=1e-4, fused=True)
         # cosine annealing lr scheduler
-        # TODO: make this optional
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.train_num_steps, eta_min=1e-6)
+        if use_muon:
+            print("lr scheduler is deactivated when using muon, at least until i figure out how to do that with multiple optimizers")
+            use_lr_scheduler = False
+        self.use_lr_scheduler = use_lr_scheduler
+        if use_lr_scheduler:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.train_num_steps, eta_min=1e-6)
+            self.scheduler = self.accelerator.prepare_scheduler(self.scheduler)
 
         # for logging results in a folder periodically
 
@@ -1146,7 +1167,7 @@ class Trainer1D(object):
 
         # prepare model, dataloader, optimizer with accelerator
         self.cond_dim = diffusion_model.cond_dim
-        self.model, self.opt, self.scheduler = self.accelerator.prepare(self.model, self.opt, self.scheduler)
+        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
         self.loss_history = []
         self.test_loss_history = []
@@ -1162,7 +1183,9 @@ class Trainer1D(object):
         data = {
             'step': self.step,
             'model': self.accelerator.get_state_dict(self.model),
-            'opt': self.opt.state_dict(),
+            # 'opts': [opt.state_dict() for opt in self.opts],
+            "opt": self.opt.state_dict(),
+            'scheduler': self.scheduler.state_dict() if self.use_lr_scheduler else None,
             'ema': self.ema.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__,
@@ -1182,7 +1205,10 @@ class Trainer1D(object):
         model.load_state_dict(data['model'])
 
         self.step = data['step']
-        self.opt.load_state_dict(data['opt'])
+        # self.opt.load_state_dict(data['opt'])
+        # for i, opt in enumerate(self.opts):
+        #     opt.load_state_dict(data["opts"][i])
+        self.opt.load_state_dict(data["opt"])
         if self.accelerator.is_main_process:
             self.ema.load_state_dict(data["ema"])
 
@@ -1195,20 +1221,20 @@ class Trainer1D(object):
         if exists(data['loss_history']):
             self.loss_history = data['loss_history'].tolist()
 
-        if exists(data['test_loss_history']):
+        if "test_loss_history" in data:
             self.test_loss_history = data['test_loss_history'].tolist()
+        
+        if self.use_lr_scheduler and "scheduler" in data:
+            self.scheduler.load_state_dict(data['scheduler'])
 
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-
             while self.step < self.train_num_steps:
                 self.model.train()
-
                 total_loss = 0.
-
                 # for _ in range(self.gradient_accumulate_every):
                 data = next(self.dl)#.to(device)
                 with accelerator.accumulate(self.model):
@@ -1220,19 +1246,24 @@ class Trainer1D(object):
 
                     self.accelerator.backward(loss)
 
-
-                    # accelerator.wait_for_everyone()
-                    if self.max_grad_norm is not None and accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
+                    if accelerator.sync_gradients:
+                        if self.max_grad_norm is not None:
+                            accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        # Step increments only on actual updates (when gradients are accumulated and ready to do backward)
+                        self.step += 1
+                        # Update EMA only when model weights change
+                        if accelerator.is_main_process:
+                            self.ema.update()
+                    # for opt in self.opts:
+                    #     opt.step()
+                    #     opt.zero_grad()
                     self.opt.step()
                     self.opt.zero_grad()
-                    self.scheduler.step()
-
+                    if self.use_lr_scheduler:
+                        self.scheduler.step()
                 # accelerator.wait_for_everyone()
 
-                self.step += 1
-                if accelerator.is_main_process:
+                if accelerator.is_main_process and accelerator.sync_gradients:
                     total_loss += loss.detach().float().mean().cpu().item()
                     self.loss_history.append(total_loss)
                     pbar.set_description(f'loss: {total_loss:.5f}')
@@ -1261,11 +1292,14 @@ class Trainer1D(object):
                         all_samples = torch.cat(all_samples_list, dim = 0)
                         self.test_loss_history.append(np.mean(test_losses))
                         torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.pt'))
-                        self.save(milestone)
+                        try:
+                            self.save(milestone)
+                        except Exception as e:
+                            print("David, algo ha salido mal guardando el modelo, aqui tienes el error", e)
                         self.save_loss_plot()
-
+                        self.ema.ema_model.train()
                 
-                
+                accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             self.save_loss_plot()
             
