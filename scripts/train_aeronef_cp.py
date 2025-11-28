@@ -1,11 +1,12 @@
 import numpy as np
 import torch
-# torch.backends.cuda.matmul.allow_tf32 = True
-# torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from torch.utils.data import TensorDataset
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance_1d import GaussianDiffusion1D, Trainer1D, Unet1D
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance import evaluate_model
-from denoising_diffusion_pytorch.dit import DiT1D_models
+from denoising_diffusion_pytorch.dit import DiT_models
+from denoising_diffusion_pytorch.transport import create_transport, Sampler, FlowMatching
 import shutil
 import os
 import matplotlib.pyplot as plt
@@ -15,6 +16,8 @@ torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 np.random.seed(42)
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True  # True: fast but may lead to some small numerical differences
 
 def get_split_indices(split_name, split_data):
     all_conditions = split_data["All"]
@@ -26,6 +29,7 @@ def get_split_indices(split_name, split_data):
     return indices
 
 data = np.load("data/aeronef/db_random.npy", allow_pickle=True).item()
+field_name_to_predict = "Cp" # "Pressure"
 # cp = data["Cp"]
 # train_size = 0.8
 # training_indices = np.random.choice(cp.shape[0], int(cp.shape[0] * train_size), replace=False)
@@ -38,7 +42,7 @@ test_indices = get_split_indices("Test", split_data)
 def load_dataset(indices, norm_coefficients, data):
     aoa = data["Alpha"][indices]
     vinf = data["Vinf"][indices]
-    cp = data["Cp"][indices]
+    cp = data[field_name_to_predict][indices]
     if "cp_min" not in norm_coefficients:
         norm_coefficients["cp_min"] = cp.min()
         norm_coefficients["cp_max"] = cp.max()
@@ -53,6 +57,12 @@ def load_dataset(indices, norm_coefficients, data):
         norm_coefficients["aoa_mean"] = aoa.mean()
         norm_coefficients["aoa_std"] = aoa.std()
     aoa = (aoa - norm_coefficients["aoa_mean"]) / norm_coefficients["aoa_std"]
+
+    # pad/truncate to length 27500
+    target_len = 27500
+    if field_name_to_predict == "Pressure" and cp.shape[1] < target_len:
+        pad_width = target_len - cp.shape[1]
+        cp = np.pad(cp, ((0, 0), (0, pad_width)), mode='constant', constant_values=0)
 
     cp_t = torch.from_numpy(cp).float().unsqueeze(1)  # add channel dimension
     # cp_t = cp_t[..., :-1]
@@ -80,37 +90,50 @@ test_dataset = load_dataset(test_indices, coefficients, data)
 #     cond_drop_prob=0.5,
 #     attn_dim_head=64,
 #     attn_heads=8,
-#     # learn_sigma=True,
+#     learn_sigma=False,
 #     # self_condition=True,
 #     # full_attn = False
 # )
-
-model = DiT1D_models['DiT1D-S/1'](
-    seq_len=data["Cp"].shape[1],
+model = DiT_models['DiT-S/1'](
+    input_size=dataset.tensors[0].shape[2],
     cond_dim=2,
-    class_dropout_prob=0.2,
+    class_dropout_prob=0.5,
     in_channels=1,
-    # learn_sigma=True,
+    learn_sigma=False,
+    # use_bias=False,
+    use_swiglu=True,
 )
 
-diffusion = GaussianDiffusion1D(
+# model = torch.compile(model)
+# diffusion = GaussianDiffusion1D(
+#     model,
+#     seq_length=dataset.tensors[0].shape[2],
+#     objective="pred_noise",  # 'pred_noise' or 'pred_x0'
+#     beta_schedule="cosine",
+#     sampling_timesteps=1000,
+#     timesteps=1000,  # number of steps
+#     # use_cfg_plus_plus=True,
+#     min_snr_loss_weight=True,
+#     min_snr_gamma=5
+# )
+
+sampler = Sampler(transport=create_transport(
+    
+))
+
+diffusion = FlowMatching(
+    sampler,
     model,
-    seq_length=data["Cp"].shape[1],
-    objective="pred_noise",  # 'pred_noise' or 'pred_x0'
-    beta_schedule="cosine",
-    sampling_timesteps=1000,
-    timesteps=1000,  # number of steps
-    # use_cfg_plus_plus=True,
-    min_snr_loss_weight=True,
-    min_snr_gamma=5
+    input_size=dataset.tensors[0].shape[2],
+    cond_scale=6,
+    num_sampling_steps=100
 )
-
 
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 1e9} GB")
 
-results_folder = 'results/aeronef_cp_new_split/dit_S_1_rmsnorm'
+results_folder = 'results/aeronef_cp_new_split/FM_dit_S_first'
 
 train_steps = 150000
 
@@ -119,20 +142,23 @@ trainer = Trainer1D(
     # 'path/to/your/images',
     dataset=dataset,
     dataset_test=val_dataset,
-    train_batch_size=32,
+    train_batch_size=64,
     train_lr=1e-4,
     num_samples=9,
     train_num_steps=train_steps+4,  # total training steps
     gradient_accumulate_every=1,  # gradient accumulation steps
-    ema_decay=0.99,  # exponential moving average decay
+    ema_decay=0.995,  # exponential moving average decay
     # amp = True,                       # turn on mixed precision
     results_folder=results_folder,  # folder to save results to
     save_and_sample_every=15000,
-    max_grad_norm=1.0
-    # use_cpu=True
+    # use_lr_scheduler=False,
+    max_grad_norm=1.0,
+    # use_cpu=True,
+    # use_muon=True,
+    compile_model=True
 )
 
-# trainer.load(10)
+# trainer.load(3)
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 trainer.train()
 # trainer.load(9)
@@ -147,7 +173,7 @@ errors, samples = evaluate_model(
     trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion
     test_parameters,
     test_data,
-    32,
+    64,
     cond_scale=6
 )
 print(f"Final errors:\n{errors}")
