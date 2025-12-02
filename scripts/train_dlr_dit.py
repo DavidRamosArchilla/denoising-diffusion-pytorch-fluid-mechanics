@@ -62,7 +62,7 @@ model = DiT1D_models['DiT1D-S/1'](
     cond_dim=2,
     class_dropout_prob=0.2,
     in_channels=1,
-    learn_sigma=True,
+    learn_sigma=False,
 )
 # model = DiT1D(
 #     depth=12,
@@ -92,7 +92,7 @@ print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 2**30} GB")
 
-results_folder = 'results/dlr/dit_S_1_no_scheduler_grad_norm_learn_sigma'
+results_folder = 'results/dlr/dit_S1_first'
 
 trainer = Trainer1D(
     diffusion,
@@ -112,20 +112,21 @@ trainer = Trainer1D(
     # use_cpu=True
 )
 torch.cuda.empty_cache()
-trainer.load(4)
-trainer.train()
-# trainer.load(10)
+# trainer.load(4)
+# trainer.train()
+trainer.load(7)
 trainer.ema.ema_model.eval() 
 # diffusion = trainer.accelerator.unwrap_model(diffusion)
 diffusion.eval()
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 
-# errors, samples = evaluate_model(
-#     trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion
-#     test_parameters,
-#     test_data,
-#     32,
-#     cond_scale=6
-# )
-# print(f"Final errors:\n{errors}")
-# torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
+test_data, test_parameters = dataset_test.tensors
+errors, samples = evaluate_model(
+    trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion
+    test_parameters,
+    test_data,
+    32,
+    cond_scale=6
+)
+print(f"Final errors:\n{errors}")
+torch.save(samples, f"{results_folder}/test_predictions_ema.pt")

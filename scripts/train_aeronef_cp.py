@@ -81,28 +81,28 @@ dataset = load_dataset(training_indices, coefficients, data)
 val_dataset = load_dataset(val_indices, coefficients, data)
 test_dataset = load_dataset(test_indices, coefficients, data)
 
-# model = Unet1D(
-#     dim=128,
-#     dim_mults=(1, 2, 2, 4),  # , 8),
-#     # flash_attn = False,
-#     channels=1,  
-#     cond_dim=2,
-#     cond_drop_prob=0.5,
-#     attn_dim_head=64,
-#     attn_heads=8,
-#     learn_sigma=False,
-#     # self_condition=True,
-#     # full_attn = False
-# )
-model = DiT_models['DiT-S/1'](
-    input_size=dataset.tensors[0].shape[2],
+model = Unet1D(
+    dim=128,
+    dim_mults=(1, 2, 2, 4),  # , 8),
+    # flash_attn = False,
+    channels=1,  
     cond_dim=2,
-    class_dropout_prob=0.5,
-    in_channels=1,
+    cond_drop_prob=0.5,
+    attn_dim_head=64,
+    attn_heads=8,
     learn_sigma=False,
-    # use_bias=False,
-    use_swiglu=True,
+    # self_condition=True,
+    # full_attn = False
 )
+# model = DiT_models['DiT-B/1'](
+#     input_size=dataset.tensors[0].shape[2],
+#     cond_dim=2,
+#     class_dropout_prob=0.5,
+#     in_channels=1,
+#     learn_sigma=False,
+#     # use_bias=False,
+#     use_swiglu=True,
+# )
 
 # model = torch.compile(model)
 # diffusion = GaussianDiffusion1D(
@@ -118,7 +118,8 @@ model = DiT_models['DiT-S/1'](
 # )
 
 sampler = Sampler(transport=create_transport(
-    
+    # use_cosine_loss=True,
+    # use_lognorm=True
 ))
 
 diffusion = FlowMatching(
@@ -126,16 +127,17 @@ diffusion = FlowMatching(
     model,
     input_size=dataset.tensors[0].shape[2],
     cond_scale=6,
-    num_sampling_steps=100
+    num_sampling_steps=500,
+    sampling_method="euler",
 )
 
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 1e9} GB")
 
-results_folder = 'results/aeronef_cp_new_split/FM_dit_S_first'
+results_folder = 'results/aeronef_cp_new_split/FM_unet_L_euler_500_200k'
 
-train_steps = 150000
+train_steps = 195000
 
 trainer = Trainer1D(
     diffusion,
@@ -158,14 +160,14 @@ trainer = Trainer1D(
     compile_model=True
 )
 
-# trainer.load(3)
+# trainer.load(10)
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 trainer.train()
 # trainer.load(9)
 
 # torch.cuda.empty_cache()  # Clear GPU memory
 trainer.ema.ema_model.eval()  # Ensure eval mode
-diffusion = trainer.accelerator.unwrap_model(diffusion)
+diffusion = trainer.accelerator.unwrap_model(diffusion, keep_torch_compile=True)
 diffusion.eval()
 
 test_data, test_parameters = test_dataset.tensors

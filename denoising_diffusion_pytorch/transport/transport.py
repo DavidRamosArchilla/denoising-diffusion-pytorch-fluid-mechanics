@@ -552,7 +552,7 @@ class FlowMatching(nn.Module):
             loss += terms["cos_loss"].mean()
         return loss
 
-    def sample(self, classes, **model_kwargs):
+    def sample(self, classes, return_all_steps=False, **model_kwargs):
         sample_fn = self.sampler.sample_ode(
             sampling_method=self.sampling_method,
             num_steps=self.num_sampling_steps,
@@ -565,7 +565,10 @@ class FlowMatching(nn.Module):
         z = torch.randn(batch_size, self.neural_net.channels, *self.input_size, device=classes.device)
         model_fn = self.neural_net.forward_with_cond_scale
         model_kwargs["classes"] = classes
-        model_kwargs["cond_scale"] = self.cond_scale
+        if "cond_scale" not in model_kwargs:
+            model_kwargs["cond_scale"] = self.cond_scale
         samples = sample_fn(z, model_fn, **model_kwargs)
+        if return_all_steps:
+            return samples
         return samples[-1]
 

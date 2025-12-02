@@ -4,6 +4,7 @@ from torch.utils.data import TensorDataset
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance_1d import Unet1D, GaussianDiffusion1D, Trainer1D
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance import evaluate_model
 from denoising_diffusion_pytorch.learned_gaussian_diffusion import LearnedGaussianDiffusion1D
+from denoising_diffusion_pytorch.transport import create_transport, Sampler, FlowMatching
 
 import shutil
 import os
@@ -50,8 +51,8 @@ test_parameters = (test_parameters - parameters_mean) / (parameters_std)
 dataset = TensorDataset(torch.tensor(data, dtype=torch.float32), torch.tensor(parameters, dtype=torch.float32))
 dataset_test = TensorDataset(torch.tensor(test_data, dtype=torch.float32), torch.tensor(test_parameters, dtype=torch.float32))
 model = Unet1D(
-    dim = 32,
-    dim_mults=(1, 2, 2), #, 8),
+    dim = 64,
+    dim_mults=(1, 2, 4), #, 8),
     # flash_attn = False,
     channels=2,
     cond_dim=2,
@@ -59,23 +60,11 @@ model = Unet1D(
     # full_attn=True,
     # cross_attn=True,
     learned_sinusoidal_cond=True,
-    learn_sigma=True,
+    learn_sigma=False,
     # self_condition=True
 )
 
-diffusion = GaussianDiffusion1D(
-    model,
-    seq_length=data.shape[-1], # 298 points of the airfoil + 2 padding --> 300 (which is divisible by 4)
-    objective='pred_noise',  # 'pred_noise' or 'pred_x0'
-    beta_schedule="cosine",
-    sampling_timesteps=1000,
-    timesteps=1000,    # number of steps
-    # use_cfg_plus_plus=False,
-    min_snr_loss_weight=True,
-    min_snr_gamma=5
-)
-
-# learned_diffusion = LearnedGaussianDiffusion1D(
+# diffusion = GaussianDiffusion1D(
 #     model,
 #     seq_length=data.shape[-1], # 298 points of the airfoil + 2 padding --> 300 (which is divisible by 4)
 #     objective='pred_noise',  # 'pred_noise' or 'pred_x0'
@@ -87,12 +76,27 @@ diffusion = GaussianDiffusion1D(
 #     min_snr_gamma=5
 # )
 
+sampler = Sampler(transport=create_transport(
+    # use_cosine_loss=True,
+    # use_lognorm=True
+))
+
+diffusion = FlowMatching(
+    sampler,
+    model,
+    input_size=data.shape[-1],
+    cond_scale=6,
+    num_sampling_steps=500,
+    sampling_method="euler",
+)
+
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 2**30} GB")
 
-results_folder = 'results/dlr/dlr_small_learn_sigma_scaled_grad_norm'
+results_folder = 'results/dlr/unet_big_FM_euler_500'
 # results_folder = 'results/dlr/test'
+
 
 trainer = Trainer1D(
     diffusion,
@@ -108,17 +112,18 @@ trainer = Trainer1D(
     # amp = True,                       # turn on mixed precision
     results_folder=results_folder,  # folder to save results to
     save_and_sample_every=10000,
-    max_grad_norm=1.0
-    # use_cpu=True
+    max_grad_norm=1.0,
+    # use_cpu=True,
+    # compile_model=True
 )
 torch.cuda.empty_cache()
 # trainer.load(7)
+shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 trainer.train()
 # trainer.load(10)
 trainer.ema.ema_model.eval() 
 # diffusion = trainer.accelerator.unwrap_model(diffusion)
 diffusion.eval()
-shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 
 errors, samples = evaluate_model(
     trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion

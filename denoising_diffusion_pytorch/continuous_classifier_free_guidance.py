@@ -1147,7 +1147,7 @@ class Trainer:
         plt.close()
 
 
-def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_size, cond_scale=6, sampler="ddpm"):
+def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_size, cond_scale=6):
     if not isinstance(conditioning_variables, torch.Tensor):
         conditioning_variables = torch.tensor(conditioning_variables).float()
     if not isinstance(real_outputs, torch.Tensor):
@@ -1157,7 +1157,7 @@ def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_
     predictions = []
     for batch in batches:
         batch = batch.to(model_device)
-        predictions.append(model.sample(batch, cond_scale=cond_scale, sampler=sampler).cpu())
+        predictions.append(model.sample(batch, cond_scale=cond_scale).cpu())
 
     predictions = torch.cat(predictions, dim=0)
     nan_values = torch.isnan(predictions)
