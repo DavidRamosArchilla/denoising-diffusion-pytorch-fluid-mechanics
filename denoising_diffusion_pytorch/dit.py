@@ -325,7 +325,7 @@ class DiT(nn.Module):
         x = x.reshape(x.shape[0], c, num_patches * p)  # (B, C, S)
         return x
 
-    def forward(self, x, t, y, *args, **kwargs):
+    def forward(self, x, t, classes, *args, **kwargs):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -335,7 +335,7 @@ class DiT(nn.Module):
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         force_drop_ids = kwargs.get("force_drop_ids", None)
-        y = self.y_embedder(y, self.training, force_drop_ids)    # (N, D)
+        y = self.y_embedder(classes, self.training, force_drop_ids)    # (N, D)
         # TODO: probar a concatenar en vez de sumar (habra que ajustar las dimensiones)
         c = t + y                                # (N, D)
         for block in self.blocks:
@@ -344,7 +344,7 @@ class DiT(nn.Module):
         x = self.unpatchify(x)                   # (B, out_channels, S)
         return x
 
-    def forward_with_cond_scale(self, x, t, y, cond_scale, *args, **kwargs):
+    def forward_with_cond_scale(self, x, t, classes, cond_scale=6, *args, **kwargs):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
@@ -359,7 +359,7 @@ class DiT(nn.Module):
             ],
             dim=0,
         )
-        y_combined = torch.cat([y, y], dim=0)
+        y_combined = torch.cat([classes, classes], dim=0)
         t_combined = torch.cat([t, t], dim=0)
         model_out = self.forward(combined, t_combined, y_combined, force_drop_ids=force_drop_ids)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
