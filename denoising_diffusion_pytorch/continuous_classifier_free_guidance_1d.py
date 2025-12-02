@@ -780,27 +780,32 @@ class GaussianDiffusion1D(Module):
         return pred_img, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, classes, shape, cond_scale = 6., rescaled_phi = 0.7, return_noise = False):
+    def p_sample_loop(self, classes, shape, cond_scale=6., rescaled_phi=0.7, return_noise=False, return_all_steps=False):
         batch, device = shape[0], self.betas.device
 
         noise = torch.randn(shape, device=device)
         img = noise 
+        imgs = [img]
 
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
             img, x_start = self.p_sample(img, t, classes, self_cond, cond_scale, rescaled_phi)
+            imgs.append(img)
+        
+        # transpose here is to keep the same format as in flow matchin sampling
+        ret = img if not return_all_steps else torch.stack(imgs, dim = 1).transpose(1, 0)
 
-        img = self.unnormalize(img)
+        ret = self.unnormalize(ret)
 
         if not return_noise:
-            return img
+            return ret
 
-        return img, noise
+        return ret, noise
 
     @torch.no_grad()
-    def ddim_sample(self, classes, shape, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True, return_noise = False):
+    def ddim_sample(self, classes, shape, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True, return_noise = False, return_all_steps=False):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -809,7 +814,7 @@ class GaussianDiffusion1D(Module):
 
         noise = torch.randn(shape, device = device)
         img = noise
-
+        imgs = [img]
         x_start = None
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
@@ -832,21 +837,24 @@ class GaussianDiffusion1D(Module):
             img = x_start * alpha_next.sqrt() + \
                   c * pred_noise + \
                   sigma * noise
+            imgs.append(img)
 
-        img = self.unnormalize(img)
+        ret = img if not return_all_steps else torch.stack(imgs, dim=1).transpose(1, 0, 2, 3)
+
+        ret = self.unnormalize(ret)
 
         if not return_noise:
-            return img
+            return ret
 
-        return img, noise
+        return ret, noise
 
     @torch.no_grad()
-    def sample(self, classes, cond_scale = 6., rescaled_phi = 0.7, return_noise=False, sampler=''):
+    def sample(self, classes, cond_scale = 6., rescaled_phi = 0.7, return_noise=False, return_all_steps=False):
         batch_size, channels = classes.shape[0], self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
 
         shape = (batch_size, channels, self.seq_length) if self.channel_first else (batch_size, self.seq_length, channels)
-        return sample_fn(classes, shape, cond_scale=cond_scale, rescaled_phi=rescaled_phi, return_noise=return_noise)
+        return sample_fn(classes, shape, cond_scale=cond_scale, rescaled_phi=rescaled_phi, return_noise=return_noise, return_all_steps=return_all_steps)
 
     @torch.no_grad()
     def interpolate(self, x1, x2, classes, t = None, lam = 0.5):
@@ -1096,7 +1104,8 @@ class Trainer1D(object):
         use_cpu=False,
         dataset_test=None,
         use_lr_scheduler=True,
-        use_muon=False
+        use_muon=False,
+        compile_model=False
     ):
         super().__init__()
 
@@ -1105,7 +1114,8 @@ class Trainer1D(object):
         self.accelerator = Accelerator(
             mixed_precision = mixed_precision_type if amp else 'no',
             cpu=use_cpu,
-            dataloader_config=DataLoaderConfiguration(split_batches=split_batches)
+            dataloader_config=DataLoaderConfiguration(split_batches=split_batches),
+            
         )
 
         # model
@@ -1168,6 +1178,10 @@ class Trainer1D(object):
         # prepare model, dataloader, optimizer with accelerator
         self.cond_dim = diffusion_model.cond_dim
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        if compile_model:
+            print("Compiling model...")
+            self.model = torch.compile(self.model)
+            print("Model compiled")
 
         self.loss_history = []
         self.test_loss_history = []
@@ -1292,10 +1306,10 @@ class Trainer1D(object):
                         all_samples = torch.cat(all_samples_list, dim = 0)
                         self.test_loss_history.append(np.mean(test_losses))
                         torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.pt'))
-                        try:
-                            self.save(milestone)
-                        except Exception as e:
-                            print("David, algo ha salido mal guardando el modelo, aqui tienes el error", e)
+                        # try:
+                        self.save(milestone)
+                        # except Exception as e:
+                        #     print("David, algo ha salido mal guardando el modelo, aqui tienes el error", e)
                         self.save_loss_plot()
                         self.ema.ema_model.train()
                 
