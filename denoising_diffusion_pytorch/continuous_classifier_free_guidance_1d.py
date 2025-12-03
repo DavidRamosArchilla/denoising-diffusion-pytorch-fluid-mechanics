@@ -820,10 +820,11 @@ class GaussianDiffusion1D(Module):
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, self_cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi, clip_x_start=clip_denoised)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, self_cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi, clip_x_start=True, rederive_pred_noise=True)
 
             if time_next < 0:
                 img = x_start
+                imgs.append(img)
                 continue
 
             alpha = self.alphas_cumprod[time]
@@ -839,7 +840,7 @@ class GaussianDiffusion1D(Module):
                   sigma * noise
             imgs.append(img)
 
-        ret = img if not return_all_steps else torch.stack(imgs, dim=1).transpose(1, 0, 2, 3)
+        ret = img if not return_all_steps else torch.stack(imgs, dim=1).transpose(1, 0)
 
         ret = self.unnormalize(ret)
 
