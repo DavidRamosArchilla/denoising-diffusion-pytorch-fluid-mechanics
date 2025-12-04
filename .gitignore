@@ -1,6 +1,7 @@
 *.sh
 # Generation results
 results*/
+media
 
 # Training data
 data/
