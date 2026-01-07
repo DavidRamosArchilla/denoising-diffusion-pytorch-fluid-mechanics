@@ -13,15 +13,42 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import repeat, rearrange
+from einops import repeat, rearrange, pack, unpack
 import numpy as np
 import math
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
-
+from timm.models.vision_transformer import PatchEmbed, Mlp # Attention
+from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention
+from functools import partial
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+def default(val, d):
+    if val is not None:
+        return val
+    return d() if callable(d) else d
+
+def pack_one_with_inverse(x, pattern):
+    packed, packed_shape = pack([x], pattern)
+
+    def inverse(x, inverse_pattern = None):
+        inverse_pattern = default(inverse_pattern, pattern)
+        return unpack(x, packed_shape, inverse_pattern)[0]
+
+    return packed, inverse
+
+def project(x, y):
+    x, inverse = pack_one_with_inverse(x, 'b *')
+    y, _ = pack_one_with_inverse(y, 'b *')
+
+    dtype = x.dtype
+    x, y = x.double(), y.double()
+    unit = F.normalize(y, dim = -1)
+
+    parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
+    orthogonal = x - parallel
+
+    return inverse(parallel).to(dtype), inverse(orthogonal).to(dtype)
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
@@ -137,10 +164,11 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, bias=True, use_swiglu=False, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, bias=True, use_swiglu=False, linear_attn=False, qk_norm=False,**attn_kwargs):
         super().__init__()
         self.norm1 = nn.RMSNorm(hidden_size, elementwise_affine=bias) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias,**block_kwargs)
+        attention_class = LinearAttention if linear_attn else Attention
+        self.attn = attention_class(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
         self.norm2 = nn.RMSNorm(hidden_size, elementwise_affine=bias) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -153,9 +181,9 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=bias)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, feat_rope=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -235,9 +263,12 @@ class DiT(nn.Module):
         depth=12,
         num_heads=8,
         mlp_ratio=4.0,
-        learn_sigma=True,
+        learn_sigma=False,
         use_bias=True, # this is to use muon
         use_swiglu=False,
+        use_rope=False,
+        linear_attn=False,
+        qk_norm=False,
         **kwargs
     ):
         super().__init__()
@@ -259,6 +290,16 @@ class DiT(nn.Module):
             self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, bias=use_bias)
             print("Creating 2D DiT")
 
+        if use_rope:
+            head_dim = hidden_size // num_heads
+            seq_len = input_size // patch_size
+            self.feat_rope = VisionRotaryEmbeddingFast(
+                dim=head_dim,
+                max_seq_len=seq_len,
+            )
+        else:
+            self.feat_rope = None
+
         self.t_embedder = TimestepEmbedder(hidden_size, bias=use_bias)
         self.y_embedder = ConditionEmbedder(cond_dim, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
@@ -266,9 +307,20 @@ class DiT(nn.Module):
         print(f"Creating DiT with {num_patches} patches.")
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
-        self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, bias=use_bias, use_swiglu=use_swiglu) for _ in range(depth)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                DiTBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    bias=use_bias,
+                    use_swiglu=use_swiglu,
+                    linear_attn=linear_attn,
+                    qk_norm=qk_norm,
+                )
+                for _ in range(depth)
+            ]
+        )
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -320,6 +372,7 @@ class DiT(nn.Module):
         c = self.out_channels
         p = self.patch_size
         num_patches = x.shape[1]
+        # TODO: no se si esto ira para 2d. Efectivamente, no.
         x = x.reshape(x.shape[0], num_patches, p, c)  # (B, num_patches, patch_size, C)
         x = x.permute(0, 3, 1, 2)  # (B, C, num_patches, patch_size)
         x = x.reshape(x.shape[0], c, num_patches * p)  # (B, C, S)
@@ -336,15 +389,26 @@ class DiT(nn.Module):
         t = self.t_embedder(t)                   # (N, D)
         force_drop_ids = kwargs.get("force_drop_ids", None)
         y = self.y_embedder(classes, self.training, force_drop_ids)    # (N, D)
-        # TODO: probar a concatenar en vez de sumar (habra que ajustar las dimensiones)
         c = t + y                                # (N, D)
         for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
+            x = block(x, c, self.feat_rope)                      # (N, T, D)
         x = self.final_layer(x, c)               # (B, num_patches, patch_size * out_channels)
         x = self.unpatchify(x)                   # (B, out_channels, S)
         return x
 
-    def forward_with_cond_scale(self, x, t, classes, cond_scale=6, *args, **kwargs):
+    def forward_with_cond_scale(
+        self,
+        x,
+        t,
+        classes,
+        cond_scale=6,
+        rescaled_phi=0.7,
+        remove_parallel_component=True,
+        keep_parallel_frac=0,
+        cfg_interval_start=0,
+        *args,
+        **kwargs,
+    ):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
@@ -369,8 +433,24 @@ class DiT(nn.Module):
         eps, rest = model_out[:, :self.channels], model_out[:, self.channels:]
         # eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cond_scale * (cond_eps - uncond_eps)
         # return half_eps, uncond_eps
+        update = cond_eps - uncond_eps
+        if remove_parallel_component:
+            parallel, orthog = project(update, cond_eps)
+            update = orthog + parallel * keep_parallel_frac
+        # half_eps = uncond_eps + cond_scale * (cond_eps - uncond_eps)
+        half_eps = cond_eps + update * (cond_scale - 1)
+
+        if cfg_interval_start > 0:
+            timestep = t[0]
+            if timestep < cfg_interval_start:
+                half_eps = cond_eps
+
+        if rescaled_phi != 0:
+            std_fn = partial(torch.std, dim = tuple(range(1, half_eps.ndim)), keepdim = True)
+            rescaled_logits = half_eps * (std_fn(cond_eps) / std_fn(half_eps))
+            half_eps = rescaled_logits * rescaled_phi + half_eps * (1. - rescaled_phi)
+
         eps = torch.cat([half_eps, uncond_eps], dim=0)
         eps_sigma = torch.cat([eps, rest], dim=1)
         # # return cfg eps and unconditioned eps

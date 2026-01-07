@@ -141,7 +141,8 @@ class Transport:
         return th.tensor(samples)
 
     def sample(self, x1, sp_timesteps=None, shifted_mu=0):
-        """Sampling x0 & t based on shape of x1 (if needed)
+        """
+        Sampling x0 & t based on shape of x1 (if needed). Shifted mu = log(3) = 1.0986??? https://arxiv.org/pdf/2506.15742
           Args:
             x1 - data point; [batch, *dim]
         """
@@ -515,6 +516,7 @@ class FlowMatching(nn.Module):
         neural_net,
         input_size,
         cond_scale=1,
+        shifted_mu=0, 
         sampler_atol=1e-6,
         sampler_rtol=1e-3,
         num_sampling_steps=50,
@@ -536,7 +538,7 @@ class FlowMatching(nn.Module):
         self.sampler_timestep_shift = sampler_timestep_shift
         self.sampling_method = sampling_method
         self.reverse_sampling = reverse_sampling
-
+        self.shifted_mu = shifted_mu
         # things to keep the same interface with GaussianDiffusion and be able to use the Trainer
         self.channels = neural_net.channels
         self.cond_dim = neural_net.cond_dim
@@ -545,6 +547,7 @@ class FlowMatching(nn.Module):
         terms = self.sampler.transport.training_losses(
             self.neural_net,
             x,
+            shifted_mu=self.shifted_mu,
             model_kwargs={"classes": classes}
         )
         loss = terms["loss"].mean()
