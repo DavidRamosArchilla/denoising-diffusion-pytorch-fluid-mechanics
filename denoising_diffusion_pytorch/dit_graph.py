@@ -46,7 +46,7 @@ def scatter_mean_pure_torch(src, index, dim=0, dim_size=None):
     return out / count
 
 
-class GeometricPatchEmbed(nn.Module):
+class GeometricPatchEmbedOld(nn.Module):
     def __init__(self, in_channels, hidden_size, bias=True):
         super().__init__()
         # MLP to process individual nodes before aggregation
@@ -106,7 +106,7 @@ class GeometricPatchEmbed(nn.Module):
         
         return self.proj(patch_embeddings)
 
-class GeometricUnpatchify(nn.Module):
+class GeometricUnpatchifyOld(nn.Module):
     def __init__(self, hidden_size, out_channels):
         super().__init__()
         
@@ -154,6 +154,119 @@ class GeometricUnpatchify(nn.Module):
         
         return out.permute(0, 2, 1) # Return (B, C, N)
     
+
+class GeometricPatchEmbed(nn.Module):
+    def __init__(self, in_channels=1, hidden_size=512, pos_dim=2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        
+        # 1. Point-wise MLP (acts like PointNet before pooling)
+        # Input: [Field_Value (1) + Relative_Pos (2)]
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels + pos_dim, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        
+        # Optional: LayerNorm before entering the transformer
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, x, cluster_ids, rel_pos):
+        """
+        x: (B, C, N_points)
+        cluster_ids: (N_points,) - Integer IDs [0, Num_Patches-1]
+        rel_pos: (N_points, 2)   - (x,y) relative to cluster centroid
+        """
+        B, C, N = x.shape
+        Num_Patches = cluster_ids.max().item() + 1
+        
+        # 1. Prepare inputs
+        # Permute x to (B, N, C)
+        x = x.transpose(1, 2) 
+        
+        # Expand rel_pos to batch: (B, N, 2)
+        rel_pos_batch = rel_pos.unsqueeze(0).expand(B, -1, -1)
+        
+        # Concatenate: (B, N, C+2)
+        # This gives the network "local context"
+        node_features = torch.cat([x, rel_pos_batch], dim=-1)
+        
+        # 2. Point-wise Feature Extraction
+        # (B, N, Hidden)
+        node_embeddings = self.mlp(node_features)
+        
+        # 3. Aggregate (Pool) nodes into patches
+        # We need to scatter_reduce (mean) from N nodes to K patches.
+        # Output shape: (B, Num_Patches, Hidden)
+        
+        # Expand cluster_ids for the batch: (B, N)
+        # We also need to expand dimensions for the gather/scatter compatibility
+        ids_expanded = cluster_ids.unsqueeze(0).unsqueeze(-1).expand(B, N, self.hidden_size)
+        
+        # Initialize output tensor
+        patch_embeddings = torch.zeros(
+            B, Num_Patches, self.hidden_size, 
+            device=x.device, dtype=x.dtype
+        )
+        
+        # Scatter Mean: Effectively "Global Average Pooling" per patch
+        # Requires PyTorch 1.12+ for scatter_reduce_
+        patch_embeddings.scatter_reduce_(
+            dim=1, 
+            index=ids_expanded, 
+            src=node_embeddings, 
+            reduce="mean",
+            include_self=False
+        )
+        
+        return self.norm(patch_embeddings)
+
+
+class GeometricUnpatchify(nn.Module):
+    def __init__(self, hidden_size=512, out_channels=1, pos_dim=2):
+        super().__init__()
+        
+        # Input: [Patch_Token (Hidden) + Relative_Pos (2)]
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size + pos_dim, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, out_channels)
+        )
+
+    def forward(self, x, cluster_ids, rel_pos):
+        """
+        x: (B, Num_Patches, Hidden) - Output from Transformer
+        cluster_ids: (N_points,)
+        rel_pos: (N_points, 2)
+        """
+        B, K, H = x.shape
+        N = cluster_ids.shape[0]
+        
+        # 1. Broadcast (Un-pool)
+        # We want to assign the patch token to every node belonging to that patch.
+        # cluster_ids: (N) -> (B, N, H)
+        ids_expanded = cluster_ids.unsqueeze(0).unsqueeze(-1).expand(B, N, H)
+        
+        # Gather: (B, Num_Patches, H) -> (B, N_points, H)
+        # For every node, grab the vector of its patch
+        node_tokens = torch.gather(x, 1, ids_expanded)
+        
+        # 2. Add Spatial Awareness
+        # We concat the relative position so the MLP knows WHERE in the patch this node is.
+        # rel_pos: (N, 2) -> (B, N, 2)
+        rel_pos_batch = rel_pos.unsqueeze(0).expand(B, -1, -1)
+        
+        # Input: (B, N, Hidden + 2)
+        decoder_input = torch.cat([node_tokens, rel_pos_batch], dim=-1)
+        
+        # 3. Decode to field values
+        # (B, N, Out_Channels)
+        out = self.mlp(decoder_input)
+        
+        # Reshape to standard image/graph format (B, C, N)
+        return out.transpose(1, 2)
+
+
 class FourierEmbedder2D(nn.Module):
     def __init__(self, hidden_size, num_frequencies=32, scale=1.0):
         super().__init__()
@@ -223,6 +336,7 @@ class GraphDiT(nn.Module):
         # Register as buffers so they move to GPU with model but aren't trained
         self.register_buffer('cluster_indices', self.cluster_ids)
         self.register_buffer('relative_positions', self.rel_pos)
+        self.register_buffer("centroids", centroids)
         
         # 2. New Embedder
         self.x_embedder = GeometricPatchEmbed(in_channels=1, hidden_size=hidden_size)
@@ -231,7 +345,6 @@ class GraphDiT(nn.Module):
         # 3. Pos Embed (Based on Centroids)
         # Use Fourier features on self.centroids
         self.pos_embed = FourierEmbedder2D(hidden_size)
-        self.register_buffer("centroids", centroids)
         # 4. Transformer Blocks (Unchanged)
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
@@ -254,7 +367,7 @@ class GraphDiT(nn.Module):
         
         return labels, rel_pos, centroids
 
-    def forward(self, x, t, y, *args, **kwargs):
+    def forward(self, x, t, classes, *args, **kwargs):
         # x: (B, 1, N_points)
         
         # Embed: Graph -> Transformer Tokens
@@ -265,7 +378,7 @@ class GraphDiT(nn.Module):
         pos = self.pos_embed(self.centroids) 
         t = self.t_embedder(t)   
         force_drop_ids = kwargs["force_drop_ids"] if "force_drop_ids" in kwargs else None
-        y = self.y_embedder(y, self.training, force_drop_ids)    # (N, D)
+        y = self.y_embedder(classes, self.training, force_drop_ids)    # (N, D)
         # TODO: probar a concatenar en vez de sumar (habra que ajustar las dimensiones)
         c = t + y    
         # ... Transformer Blocks Loop ...
