@@ -1157,7 +1157,8 @@ def evaluate_model(model, conditioning_variables, real_outputs, inference_batch_
     predictions = []
     for batch in batches:
         batch = batch.to(model_device)
-        predictions.append(model.sample(batch, cond_scale=cond_scale).cpu())
+        with torch.inference_mode():
+            predictions.append(model.sample(batch, cond_scale=cond_scale).cpu())
 
     predictions = torch.cat(predictions, dim=0)
     nan_values = torch.isnan(predictions)

@@ -462,6 +462,7 @@ class Unet1D(Module):
         rescaled_phi = 0.,
         remove_parallel_component = True,
         keep_parallel_frac = 0.,
+        cfg_interval_start=0.,
         **kwargs
     ):
         logits = self.forward(*args, cond_drop_prob = 0., **kwargs)
@@ -477,7 +478,10 @@ class Unet1D(Module):
             update = orthog + parallel * keep_parallel_frac
 
         scaled_logits = logits + update * (cond_scale - 1.)
-
+        if cfg_interval_start > 0:
+            timestep = args[1][0] # args[1] is t
+            if timestep < cfg_interval_start:
+                scaled_logits = logits
         if rescaled_phi == 0.:
             return scaled_logits
 
@@ -1099,24 +1103,25 @@ class Trainer1D(object):
         num_samples = 25,
         results_folder = './results',
         amp = False,
-        mixed_precision_type = 'fp16',
+        mixed_precision_type = 'bf16',
         split_batches = True,
         max_grad_norm = None,
         use_cpu=False,
         dataset_test=None,
-        use_lr_scheduler=True,
+        eta_min_scheduler=None,
         use_muon=False,
         compile_model=False
     ):
         super().__init__()
 
         # accelerator
-
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         self.accelerator = Accelerator(
             mixed_precision = mixed_precision_type if amp else 'no',
             cpu=use_cpu,
             dataloader_config=DataLoaderConfiguration(split_batches=split_batches),
-            
+            gradient_accumulation_steps=gradient_accumulate_every,
         )
 
         # model
@@ -1140,7 +1145,10 @@ class Trainer1D(object):
 
         dl = DataLoader(dataset, batch_size = train_batch_size, shuffle=True, pin_memory=True, num_workers=4, persistent_workers=True)
         if dataset_test is not None:
-            self.dl_test = DataLoader(dataset_test, batch_size = train_batch_size, shuffle=False, pin_memory=True, num_workers=4, persistent_workers=True)
+            self.dl_test = DataLoader(dataset_test, batch_size = train_batch_size//gradient_accumulate_every//2, shuffle=False, pin_memory=True, num_workers=4)
+        else:
+            self.dl_test = None
+
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
@@ -1152,22 +1160,23 @@ class Trainer1D(object):
         #     self.opts = [torch.optim.Muon(muon_paramaters, lr=train_lr, weight_decay=1e-3), AdamW(adam_parameters, lr=train_lr, betas=adam_betas, weight_decay=1e-4, fused=True)]
         # else:
         #     self.opts = [AdamW(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=1e-4, fused=True)]
-        
-        self.opt = AdamW(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=1e-4, fused=True)
+        eps = 1e-6 if mixed_precision_type == 'fp16' or mixed_precision_type == 'bf16' else 1e-8
+        self.opt = AdamW(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=1e-2, fused=True, eps=eps)
         # cosine annealing lr scheduler
+        self.use_lr_scheduler = eta_min_scheduler is not None
         if use_muon:
             print("lr scheduler is deactivated when using muon, at least until i figure out how to do that with multiple optimizers")
-            use_lr_scheduler = False
-        self.use_lr_scheduler = use_lr_scheduler
-        if use_lr_scheduler:
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.train_num_steps, eta_min=1e-6)
+            self.use_lr_scheduler = False
+            
+        if self.use_lr_scheduler:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.train_num_steps, eta_min=eta_min_scheduler)
             self.scheduler = self.accelerator.prepare_scheduler(self.scheduler)
 
         # for logging results in a folder periodically
 
         if self.accelerator.is_main_process:
             self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device)
+            self.ema.to(self.device, dtype=torch.float32) # 
 
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
@@ -1181,7 +1190,8 @@ class Trainer1D(object):
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
         if compile_model:
             print("Compiling model...")
-            self.model = torch.compile(self.model)
+            self.model = torch.compile(self.model) # mode="reduce-overhead"
+            # self.model.neural_net = torch.compile(self.model.neural_net) # mode="reduce-overhead"
             print("Model compiled")
 
         self.loss_history = []
@@ -1195,6 +1205,8 @@ class Trainer1D(object):
         if not self.accelerator.is_local_main_process:
             return
 
+        lr = self.opt.param_groups[0]['lr']
+
         data = {
             'step': self.step,
             'model': self.accelerator.get_state_dict(self.model),
@@ -1204,6 +1216,7 @@ class Trainer1D(object):
             'ema': self.ema.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__,
+            'lr': lr,
             'loss_history': torch.tensor(self.loss_history),
             'test_loss_history': torch.tensor(self.test_loss_history)
         }
@@ -1241,6 +1254,11 @@ class Trainer1D(object):
         
         if self.use_lr_scheduler and "scheduler" in data:
             self.scheduler.load_state_dict(data['scheduler'])
+        
+        if "lr" in data:
+            print(f"Setting loaded learning rate to {data['lr']}")
+            for param_group in self.opt.param_groups:
+                param_group['lr'] = data['lr']
 
     def train(self):
         accelerator = self.accelerator
@@ -1260,15 +1278,13 @@ class Trainer1D(object):
                         # total_loss += loss.item()
 
                     self.accelerator.backward(loss)
-
+                    # accelerator.wait_for_everyone()
                     if accelerator.sync_gradients:
                         if self.max_grad_norm is not None:
                             accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         # Step increments only on actual updates (when gradients are accumulated and ready to do backward)
                         self.step += 1
-                        # Update EMA only when model weights change
-                        if accelerator.is_main_process:
-                            self.ema.update()
+
                     # for opt in self.opts:
                     #     opt.step()
                     #     opt.zero_grad()
@@ -1276,6 +1292,7 @@ class Trainer1D(object):
                     self.opt.zero_grad()
                     if self.use_lr_scheduler:
                         self.scheduler.step()
+
                 # accelerator.wait_for_everyone()
 
                 if accelerator.is_main_process and accelerator.sync_gradients:
@@ -1287,34 +1304,34 @@ class Trainer1D(object):
 
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
                         self.ema.ema_model.eval()
-
                         # with torch.no_grad():
                         #     milestone = self.step // self.save_and_sample_every
                         #     random_classes = torch.rand((self.num_samples, self.cond_dim), device=device)
                         #     batches = torch.split(random_classes, self.batch_size)
                         #     all_samples_list = list(map(lambda n: self.ema.ema_model.sample(classes=n), batches))
-                        all_samples_list = []
-                        with torch.no_grad():
-                            test_losses = []
-                            milestone = self.step // self.save_and_sample_every
-                            for data in self.dl_test:
-                                sequence, classes = data[0].to(device), data[1].to(device)
-                                pred = self.ema.ema_model.sample(classes=classes)
-                                all_samples_list.append(pred)
-                                mse = ((pred - sequence) ** 2).mean()
-                                test_losses.append(mse.cpu().numpy())
+                        milestone = self.step // self.save_and_sample_every
+                        if self.dl_test is not None:
+                            all_samples_list = []
+                            with torch.no_grad():
+                                test_losses = []
+                                for data in self.dl_test:
+                                    sequence, classes = data[0].to(device), data[1].to(device)
+                                    with accelerator.autocast():
+                                        pred = self.ema.ema_model.sample(classes=classes)
+                                    all_samples_list.append(pred.float())
+                                    mse = ((pred - sequence) ** 2).mean()
+                                    test_losses.append(mse.cpu().numpy())
 
-                        all_samples = torch.cat(all_samples_list, dim = 0)
-                        self.test_loss_history.append(np.mean(test_losses))
-                        torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.pt'))
-                        # try:
+                            all_samples = torch.cat(all_samples_list, dim = 0)
+                            self.test_loss_history.append(np.mean(test_losses))
+                            torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.pt'))
                         self.save(milestone)
-                        # except Exception as e:
-                        #     print("David, algo ha salido mal guardando el modelo, aqui tienes el error", e)
                         self.save_loss_plot()
                         self.ema.ema_model.train()
-                
+
+                # if accelerator.sync_gradients:
                 accelerator.wait_for_everyone()
+
         if accelerator.is_main_process:
             self.save_loss_plot()
             
