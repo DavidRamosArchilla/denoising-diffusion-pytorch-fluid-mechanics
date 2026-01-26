@@ -17,8 +17,15 @@ from einops import repeat, rearrange, pack, unpack
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Mlp # Attention
-from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention
+from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention, WindowAttention
 from functools import partial
+from . import is_triton_module_available
+
+_triton_modules_available = False
+if is_triton_module_available():
+    from .fastlinear.modules import TritonLiteMLA, TritonMBConvPreGLU
+
+    _triton_modules_available = True
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -164,12 +171,25 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, bias=True, use_swiglu=False, linear_attn=False, qk_norm=False, num_experts=None, num_experts_per_tok=None, **attn_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, bias=True, use_swiglu=False, attn_type="vanilla", qk_norm=False, num_experts=None, num_experts_per_tok=None, **attn_kwargs):
         super().__init__()
         self.norm1 = nn.RMSNorm(hidden_size, elementwise_affine=bias) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        attention_class = LinearAttention if linear_attn else Attention
-        self.attn = attention_class(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
+        # attention_class = LinearAttention if linear_attn else Attention
+        # self.attn = attention_class(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
         self.norm2 = nn.RMSNorm(hidden_size, elementwise_affine=bias) # nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        if attn_type == "vanilla":
+            self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
+        elif attn_type == "linear":
+            self.attn = LinearAttention(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
+        elif attn_type == "triton_linear":
+            if not _triton_modules_available:
+                raise ValueError(
+                    f"{attn_type} type is not available due to _triton_modules_available={_triton_modules_available}."
+                )
+            # linear self attention with triton kernel fusion
+            # TODO: Here the num_heads set to 36 for tmp used
+            self.attn = TritonLiteMLA(hidden_size, num_heads=num_heads, eps=1e-8)
+
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         if num_experts is not None and num_experts_per_tok is not None:
@@ -190,6 +210,43 @@ class DiTBlock(nn.Module):
         return x
 
 
+def window_partition(x, window_size):
+    """
+    Args:
+        x: (B, N, C)
+        window_size (int): window size
+
+    Returns:
+        windows: (num_windows*B, window_size, C)
+    """
+    B, N, C = x.shape
+    # x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    # windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    x = x.view(B, N // window_size, window_size, C)
+    windows = x.permute(0, 1, 2, 3).contiguous().view(-1, window_size, C)
+    return windows
+
+
+class WindowBlock(DiTBlock):
+    """
+    Block for DiT with window attention.
+    """
+    def __init__(self, hidden_size, num_heads, window_size, shift_size=0, *args, **kwargs):
+        super().__init__(hidden_size, num_heads, *args, **kwargs)
+        # override attention with window attention
+        self.attn = WindowAttention(hidden_size, window_size=window_size, num_heads=num_heads, qkv_bias=False)
+        self.window_size = window_size
+        # shift_size will be ignored for the moment
+
+    def forward(self, x, c, feat_rope=None):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        x = modulate(self.norm1(x), shift_msa, scale_msa)
+        x_windows = window_partition(x, self.window_size) 
+        attn_windows = self.attn(x_windows).view(x.shape) # window reverse operation
+        x = x + gate_msa.unsqueeze(1) * attn_windows
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
 class FinalLayer(nn.Module):
     """
     The final layer of DiT.
@@ -208,6 +265,7 @@ class FinalLayer(nn.Module):
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
+
 
 #################################################################################
 #                                     1D DiT                                    #
@@ -334,131 +392,6 @@ class AddAuxiliaryLoss(torch.autograd.Function):
         return grad_output, grad_loss
 
 
-class PermutedMoeMLP(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, num_experts, top_k):
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        
-        # We store experts in a ModuleList so they are standard parameters
-        # This keeps memory usage identical to the original slow code
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_size, intermediate_size, bias=False),
-                nn.SiLU(),
-                nn.Linear(intermediate_size, hidden_size, bias=False)
-            ) for _ in range(num_experts)
-        ])
-
-    def forward(self, x, topk_idx, topk_weights):
-        """
-        x: [B, S, H]
-        topk_idx: [B, S, K]
-        topk_weights: [B, S, K]
-        """
-        B, S, H = x.shape
-        total_tokens = B * S
-        
-        # 1. Flatten the inputs
-        x_flat = x.view(total_tokens, H)
-        
-        # We need to process each "choice" (k) separately because a token can go to multiple experts
-        # Repeat x for the top-k choices: [Total_Tokens * K, H]
-        x_expanded = x_flat.repeat_interleave(self.top_k, dim=0)
-        
-        # Flatten indices and weights to match x_expanded
-        expert_indices = topk_idx.view(-1)      # [Total_Tokens * K]
-        weights_flat = topk_weights.view(-1)    # [Total_Tokens * K]
-
-        # 2. Sort tokens by expert index
-        # This groups all tokens needing Expert 0, then Expert 1, etc.
-        sorted_expert_indices, sort_map = torch.sort(expert_indices)
-        
-        # Permute the data to match the sorted order
-        x_sorted = x_expanded[sort_map]
-        
-        # 3. Process chunks
-        # We count how many tokens go to each expert to know where to slice
-        expert_counts = torch.bincount(expert_indices, minlength=self.num_experts).cpu()
-        
-        # Prepare output container
-        results_sorted = torch.zeros_like(x_sorted)
-        
-        # Loop through experts (Sequential compute, but on contiguous memory)
-        # This is much faster than boolean masking because there is no GPU synchronization overhead
-        start_idx = 0
-        for i in range(self.num_experts):
-            count = expert_counts[i].item()
-            if count > 0:
-                end_idx = start_idx + count
-                
-                # SLICE the contiguous block of tokens for this expert
-                expert_in = x_sorted[start_idx:end_idx]
-                
-                # RUN the expert
-                expert_out = self.experts[i](expert_in)
-                
-                # STORE results
-                results_sorted[start_idx:end_idx] = expert_out
-                
-                start_idx = end_idx
-        
-        # 4. Un-sort (Restore original order)
-        # We need to put the results back into the original token positions
-        # "argsort" of the sort_map gives us the inverse permutation
-        _, inverse_map = torch.sort(sort_map)
-        results_expanded = results_sorted[inverse_map]
-        
-        # 5. Weighted Sum
-        # Multiply by the gating weights
-        results_weighted = results_expanded * weights_flat.unsqueeze(-1)
-        
-        # Reshape back to [B * S, K, H] and sum across K (the top-k experts)
-        results_final = results_weighted.view(total_tokens, self.top_k, H).sum(dim=1)
-        
-        return results_final.view(B, S, H)
-    
-
-class EfficientMoeBlock(nn.Module):
-    def __init__(self, embed_dim, mlp_ratio=4, num_experts=16, num_experts_per_tok=2):
-        super().__init__()
-        self.num_experts_per_tok = num_experts_per_tok
-        intermediate_size = int(embed_dim * mlp_ratio)
-        
-        # Router
-        self.gate = MoEGate(embed_dim=embed_dim, num_experts=num_experts, num_experts_per_tok=num_experts_per_tok)
-        
-        # Expert specialized executor (The Permuted version for speed)
-        self.permuted_experts = PermutedMoeMLP(embed_dim, intermediate_size, num_experts, num_experts_per_tok)
-        
-        # Shared Expert
-        self.shared = nn.Sequential(
-            nn.Linear(embed_dim, intermediate_size, bias=False),
-            nn.SiLU(),
-            nn.Linear(intermediate_size, embed_dim, bias=False)
-        )
-
-    def forward(self, hidden_states):
-        # 1. Get routing info and aux loss
-        topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
-        
-        # 2. Compute Experts (Efficiently)
-        y = self.permuted_experts(hidden_states, topk_idx, topk_weight)
-        
-        # 3. Add Shared Expert
-        y = y + self.shared(hidden_states)
-        
-        # 4. Inject Aux Loss into the autograd graph
-        # This returns ONLY a tensor, but backward() will compute aux_loss grads!
-        if self.training and aux_loss is not None:
-            y = AddAuxiliaryLoss.apply(y, aux_loss)
-            
-        return y
-
-# (Keep your MoEGate class as is)
-
 class MoeMLP(nn.Module):
     def __init__(self, hidden_size, intermediate_size, pretraining_tp=2):
         super().__init__()
@@ -577,7 +510,8 @@ class DiT(nn.Module):
         use_bias=True, # this is to use muon
         use_swiglu=False,
         use_rope=False,
-        linear_attn=False,
+        attn_type="vanilla",
+        window_size=64,
         qk_norm=False,
         num_experts=None,
         num_experts_per_tok=None,
@@ -617,16 +551,16 @@ class DiT(nn.Module):
         # Will use fixed sin-cos embedding:
         print(f"Creating DiT with {num_patches} patches.")
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
-
+        block_class = partial(WindowBlock, window_size=window_size) if attn_type == "window" else DiTBlock
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(
+                block_class(
                     hidden_size,
                     num_heads,
                     mlp_ratio=mlp_ratio,
                     bias=use_bias,
                     use_swiglu=use_swiglu,
-                    linear_attn=linear_attn,
+                    attn_type=attn_type,
                     qk_norm=qk_norm,
                     num_experts=num_experts,
                     num_experts_per_tok=num_experts_per_tok,
@@ -691,7 +625,7 @@ class DiT(nn.Module):
         x = x.reshape(x.shape[0], c, num_patches * p)  # (B, C, S)
         return x
 
-    def forward(self, x, t, classes, *args, **kwargs):
+    def forward(self, x, t, classes, return_act=False, *args, **kwargs):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -705,8 +639,11 @@ class DiT(nn.Module):
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c, self.feat_rope)                      # (N, T, D)
+        act = x
         x = self.final_layer(x, c)               # (B, num_patches, patch_size * out_channels)
         x = self.unpatchify(x)                   # (B, out_channels, S)
+        if return_act:
+            return x, act
         return x
 
     def forward_with_cond_scale(
