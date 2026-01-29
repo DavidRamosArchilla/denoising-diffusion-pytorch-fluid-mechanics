@@ -2,12 +2,13 @@ import torch as th
 import torch
 import torch.nn as nn
 import numpy as np
+from scipy.stats import norm
 
 import enum
 
 from . import path
 from .integrators import ode, sde
-from scipy.stats import norm
+from ..sampling.dpm_solver import DPMS
 
 class ModelType(enum.Enum):
     """
@@ -59,6 +60,8 @@ class Transport:
         partitial_train=None,
         partial_ratio=1.0,
         shift_lg=False,
+        equilibrium_matching=False,
+        energy_formulation="l2"
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -76,6 +79,8 @@ class Transport:
         self.partitial_train = partitial_train
         self.partial_ratio = partial_ratio
         self.shift_lg = shift_lg
+        self.equilibrium_matching = equilibrium_matching
+        self.ebm = energy_formulation
 
     def prior_logp(self, z):
         '''
@@ -173,6 +178,17 @@ class Transport:
         t = t.to(x1)
         return t, x0, x1
     
+    def disp_loss(self, z): # Dispersive Loss implementation (InfoNCE-L2 variant)
+        z = z.reshape((z.shape[0],-1)) # flatten
+        diff = th.nn.functional.pdist(z).pow(2)/z.shape[1] # normalize by dimension
+        diff = th.concat((diff, diff, th.zeros(z.shape[0]).cuda()))  # match JAX implementation of full BxB matrix
+        return th.log(th.exp(-diff).mean())
+
+    def get_ct(self, t): #ct implementation
+        interp = 0.8
+        start = 1.0
+        ct = th.minimum(start-(start-1)/(interp)*t, 1/(1-interp)-1/(1-interp)*t)*4
+        return ct
 
     def training_losses(
         self, 
@@ -193,7 +209,31 @@ class Transport:
         
         t, x0, x1 = self.sample(x1, sp_timesteps, shifted_mu)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
+        xt.requires_grad = True
+        if self.equilibrium_matching:
+            ut = ut * self.get_ct(t)[:,None,None,None] # use energy-compatible target
         model_output = model(xt, t, **model_kwargs)
+        disp_loss = 0
+        if self.equilibrium_matching:
+            # get intermediate activation and apply Dispersive Loss
+            # disp_loss = self.disp_loss(model_output)
+            # xt.requires_grad = True
+            x = model_output
+            if self.ebm == 'l2':
+                # print(x.shape)
+                E = -torch.sum(x**2, dim=(1,2))/2
+                if E.requires_grad:
+                    x = torch.autograd.grad([E.sum()],[xt],create_graph=True)[0] 
+            if self.ebm == 'dot':
+                E = torch.sum(x*xt, dim=(1,2))
+                if E.requires_grad:
+                    x = torch.autograd.grad([E.sum()],[xt],create_graph=True)[0]
+            if self.ebm == 'mean':
+                E = torch.sum(x*xt, dim=(1,2))
+                if E.requires_grad:
+                    x = torch.autograd.grad([E.sum()],[xt],create_graph=True)[0] 
+            model_output = x
+
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
 
@@ -219,7 +259,7 @@ class Transport:
                 terms['loss'] = mean_flat(weight * ((model_output - x0) ** 2))
             else:
                 terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
-                
+        terms["loss"] += 0.5 * disp_loss
         return terms
     
 
@@ -574,4 +614,30 @@ class FlowMatching(nn.Module):
         if return_all_steps:
             return samples
         return samples[-1]
+
+    def sample_flow_dpm(self, classes, order=2, flow_shift=1.0, **model_kwargs):
+        batch_size = classes.shape[0]
+        z = torch.randn(batch_size, self.neural_net.channels, *self.input_size, device=classes.device)
+        null_cond = self.neural_net.null_classes_emb.repeat(batch_size, 1) # esto solo funciona para la unet
+        # repeat null cond to match batch size
+        model_kwargs["uncondition"] = null_cond
+        # print(classes.shape, null_cond.shape)
+        dpm_solver = DPMS(
+            self.neural_net.forward_with_dpmsolver,
+            condition=classes,
+            uncondition=null_cond,
+            cfg_scale=self.cond_scale,
+            model_type="flow",
+            model_kwargs=model_kwargs,
+            schedule="FLOW",
+        )
+        denoised = dpm_solver.sample(
+            z,
+            steps=self.num_sampling_steps,
+            order=order,
+            skip_type="time_uniform_flow",
+            method="multistep",
+            flow_shift=flow_shift,
+        )
+        return denoised
 

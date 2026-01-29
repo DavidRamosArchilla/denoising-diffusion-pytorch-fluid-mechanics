@@ -11,6 +11,8 @@ def create_transport(
     partitial_train=None,
     partial_ratio=1.0,
     shift_lg=False,
+    equilibrium_matching=False,
+    energy_formulation="l2"
 ):
     """function for creating Transport object
     **Note**: model prediction defaults to velocity
@@ -68,6 +70,8 @@ def create_transport(
         partitial_train=partitial_train,
         partial_ratio=partial_ratio,
         shift_lg=shift_lg,
+        equilibrium_matching=equilibrium_matching,
+        energy_formulation=energy_formulation
     )
     
     return state

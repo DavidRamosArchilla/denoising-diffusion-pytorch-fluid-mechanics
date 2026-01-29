@@ -53,7 +53,7 @@ def sanity_check_splits(split_data):
     print("✅ Sanity check passed: splits are disjoint and complete.")
 
 data = np.load("data/aeronef/db_random.npy", allow_pickle=True).item()
-field_name_to_predict = "Cp" # "Pressure"
+field_name_to_predict = "Cp" # "Pressure", Cp
 # cp = data["Cp"]
 # train_size = 0.8
 # training_indices = np.random.choice(cp.shape[0], int(cp.shape[0] * train_size), replace=False)
@@ -73,6 +73,9 @@ def load_dataset(indices, norm_coefficients, data):
     #     norm_coefficients["cp_min"] = cp.min()
     #     norm_coefficients["cp_max"] = cp.max()
     # cp = (cp - norm_coefficients["cp_min"]) / (norm_coefficients["cp_max"] - norm_coefficients["cp_min"])
+    # feature_range = [-1, 1]
+    # cp = cp * (feature_range[1] - feature_range[0]) + feature_range[0]
+    # norm_coefficients["feature_range"] = feature_range
     if "cp_mean" not in norm_coefficients:
         norm_coefficients["cp_mean"] = cp.mean()
         norm_coefficients["cp_std"] = cp.std()
@@ -89,17 +92,18 @@ def load_dataset(indices, norm_coefficients, data):
     aoa = (aoa - norm_coefficients["aoa_mean"]) / norm_coefficients["aoa_std"]
 
     # pad/truncate to length 27500
-    target_len = 27500
-    if field_name_to_predict == "Pressure" and cp.shape[1] < target_len:
-        pad_width = target_len - cp.shape[1]
-        cp = np.pad(cp, ((0, 0), (0, pad_width)), mode='constant', constant_values=0)
-
+    # target_len = 27500 # 704 = 64*11 | 27499 = 257*107
+    # if field_name_to_predict == "Pressure" and cp.shape[1] < target_len:
+    #     pad_width = target_len - cp.shape[1]
+    #     cp = np.pad(cp, ((0, 0), (0, pad_width)), mode='constant', constant_values=0)
+    # pad_width = 704 - cp.shape[1]
+    # cp = np.pad(cp, ((0, 0), (0, pad_width)), mode='constant', constant_values=0)
     cp_t = torch.from_numpy(cp).float().unsqueeze(1)  # add channel dimension
     # cp_t = cp_t[..., :-1]
     aoa_t = torch.from_numpy(aoa).float()
     mach_t = torch.from_numpy(vinf).float()
     conditions = torch.stack([aoa_t, mach_t], dim=1)
-    print(cp.min(), cp.max())
+    print(cp.mean(), cp.std())
     print(aoa.mean(), aoa.std())
     print(vinf.mean(), vinf.std())
     print(cp_t.shape, conditions.shape)
@@ -117,23 +121,28 @@ test_dataset = load_dataset(test_indices, coefficients, data)
 #     # flash_attn = False,
 #     channels=1,  
 #     cond_dim=2,
-#     cond_drop_prob=0.5,
+#     cond_drop_prob=0.2,
 #     attn_dim_head=64,
 #     attn_heads=8,
 #     learn_sigma=False,
 #     # self_condition=True,
-#     # full_attn = False
+#     full_attn=True,
+#     # qknorm=True
 # )
-model = DiT_models['DiT-L/1'](
+model = DiT_models['DiT-B/1'](
     input_size=dataset.tensors[0].shape[2],
     cond_dim=2,
-    class_dropout_prob=0.5,
+    class_dropout_prob=0.2,
     in_channels=1,
     learn_sigma=False,
     # use_bias=False,
     use_swiglu=True,
     use_rope=False,
     qk_norm=True,
+    attn_type="linear", # window
+    # window_size=107,
+    # num_experts=16,
+    # num_experts_per_tok=2
 )
 
 # diffusion = GaussianDiffusion1D(
@@ -168,13 +177,13 @@ print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 1e9} GB")
 # TIENES LA NORMALIZACION DE LOS DATOS CAMBIADA
-results_folder = 'results/aeronef_cp_new_split/FM_dit_L_bf16_qknorm'
+results_folder = 'results/aeronef_cp_new_split/FM_dit_B_24_heads_linear'
 
 train_steps = 200000
 trainer = Trainer1D(
     diffusion,
     dataset=dataset,
-    # dataset_test=val_dataset, # small_val_dataset is to avoid timout when training on 2 GPUs
+    dataset_test=val_dataset, # small_val_dataset is to avoid timout when training on 2 GPUs
     train_batch_size=64,
     train_lr=2e-4,
     num_samples=9,
@@ -189,11 +198,11 @@ trainer = Trainer1D(
     max_grad_norm=1.0,
     # use_cpu=True,
     # use_muon=True,
-    # compile_model=True,
+    compile_model=True,
     split_batches=True
 )
 
-# trainer.load(21)
+# trainer.load(29)
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 with open(os.path.join(results_folder, 'norm_coefficients.json'), 'w') as f:
     json.dump(coefficients, f, indent=4)
@@ -215,3 +224,13 @@ if trainer.accelerator.is_main_process:
     )
     print(f"Final errors:\n{errors}")
     torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
+
+    from cetaceo.evaluators import RegressionEvaluator
+    # preds = preds * (cp_max - cp_min) + cp_min
+    samples = (samples * coefficients["cp_std"]) + coefficients["cp_mean"]
+    test_data = (test_data * coefficients["cp_std"]) + coefficients["cp_mean"]
+
+    evaluator = RegressionEvaluator()
+    metrics = evaluator(samples, test_data)
+    # metrics = evaluator(preds, cp_test) # cp_test
+    evaluator.print_metrics()

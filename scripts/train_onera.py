@@ -2,6 +2,7 @@ import numpy as np
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
 from torch.utils.data import TensorDataset
 import torch.nn.functional as F
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance_1d import GaussianDiffusion1D, Trainer1D, Unet1D
@@ -11,6 +12,11 @@ from denoising_diffusion_pytorch.transport import create_transport, Sampler, Flo
 import shutil
 import os
 import pandas as pd
+
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+np.random.seed(42)
 
 
 qoi_list = ['cp', 'cfx', 'cfy', 'cfz'] # names of the quantites of interest
@@ -52,6 +58,11 @@ X_test = X_test_conditions
 Y_train = Y_train_tot_conditions
 Y_test = Y_test_tot_conditions
 
+# reduce the number of geometric points
+# num_points_to_keep = 75000
+# selected_indices = np.random.choice(nwallp, num_points_to_keep, replace=False)
+# Y_train = Y_train[:, selected_indices, :]
+# Y_test = Y_test[:, selected_indices, :]
 
 # process with torch 
 # first, move channels dim
@@ -70,6 +81,7 @@ X_train = (X_train - condition_mean) / condition_std
 X_test = (X_test - condition_mean) / condition_std
 
 # pad sequences to a multple of a power of 2. 260864 = 256 * 1019
+original_length = Y_train.shape[2]
 pad_length = 260864
 Y_train = F.pad(Y_train, (0, pad_length - nwallp))
 Y_test = F.pad(Y_test, (0, pad_length - nwallp))
@@ -112,20 +124,23 @@ dataset_test = TensorDataset(
 #     use_rope=True,
 # )
 model = DiT(
-    depth=8,
-    hidden_size=256,
+    depth=6,
+    hidden_size=128,
     patch_size=1,
     num_heads=4,
-    input_size=pad_length,
+    input_size=Y_train.shape[2],
     cond_dim=dataset_train.tensors[1].shape[1],
-    class_dropout_prob=0.5,
+    class_dropout_prob=0.1,
     in_channels=dataset_train.tensors[0].shape[1],
     learn_sigma=False,
     use_swiglu=True,
-    linear_attn=True,
+    attn_type="linear",
     qk_norm=True, # to avoid stability issues with bf16
+    mlp_ratio=4,
+    # num_experts=8,
+    # num_experts_per_tok=2
 )
-
+print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 
 # diffusion = GaussianDiffusion1D(
 #     model,
@@ -154,20 +169,19 @@ diffusion = FlowMatching(
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/onera/dit_XS_1_linear_bf16'
+results_folder = 'results/onera/dit_XXS_1_linear_bf16'
 
-train_steps = 200000
+train_steps = 105000
 
 trainer = Trainer1D(
     diffusion,
-    # 'path/to/your/images',
     dataset=dataset_train,
     # dataset_test=dataset_test,
-    train_batch_size=2,
+    train_batch_size=4,
     train_lr=2e-4,
     num_samples=9,
     train_num_steps=train_steps+4,  # total training steps
-    gradient_accumulate_every=16,  # gradient accumulation steps
+    gradient_accumulate_every=8,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
     amp = True,                       # turn on mixed precision
     mixed_precision_type='bf16',
@@ -181,9 +195,9 @@ trainer = Trainer1D(
     split_batches=True
 )
 
-# trainer.load(13)
+trainer.load(6)
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
-trainer.train()
+# trainer.train()
 
 if trainer.accelerator.is_main_process:
     # torch.cuda.empty_cache()  # Clear GPU memory
@@ -196,8 +210,19 @@ if trainer.accelerator.is_main_process:
         trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion
         test_parameters,
         test_data,
-        16,
+        4,
         cond_scale=6
     )
     print(f"Final errors:\n{errors}")
-    torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
+    samples = samples[:, :, :original_length]  # unpad
+    torch.save(samples, f"{results_folder}/sample-6.pt")
+
+    from cetaceo.evaluators import RegressionEvaluator
+    # preds = preds * (cp_max - cp_min) + cp_min
+    samples = (samples * train_std) + train_mean
+    test_data = (test_data * train_std) + train_mean
+
+    evaluator = RegressionEvaluator()
+    metrics = evaluator(samples, test_data)
+    # metrics = evaluator(preds, cp_test) # cp_test
+    evaluator.print_metrics()

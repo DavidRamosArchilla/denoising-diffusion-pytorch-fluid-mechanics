@@ -14,13 +14,13 @@ torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 
-data = np.load("data/non_linear_eq/train_high_resolution_solutions.npy")
+data = np.load("data/non_linear_eq/train_medium_resolution_solutions.npy")
 data_min, data_max = data.min(), data.max()
 data = (data - data_min) / (data_max - data_min)   # scale to [0,1]
 data = data * 2.0 - 1.0                           # rescale to [-1,1]
 data = data[:, np.newaxis, :, :]                  # add channel dim
 
-parameters = np.load("data/non_linear_eq/train_high_resolution_parameters.npy")
+parameters = np.load("data/non_linear_eq/train_medium_resolution_parameters.npy")
 parameters_mean, parameters_std = parameters.mean(axis=0), parameters.std(axis=0)
 parameters = (parameters - parameters_mean) / parameters_std
 
@@ -56,9 +56,9 @@ vae = AutoencoderKL(
     up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
     norm_num_groups=8,
 )
-
+print(vae)
 vae.config.scaling_factor = 0.18215
-vae.config.downsample_factor = 8
+# vae.config.downsample_factor = 8
 
 grad_accum_steps = 4   # effective batch size = 4 * 4 = 16
 accelerator = Accelerator(gradient_accumulation_steps=grad_accum_steps)
@@ -68,7 +68,7 @@ optimizer = AdamW(vae.parameters(), lr=1e-4, weight_decay=0.0)
 num_epochs = 40
 kl_weight = 1e-6
 log_every = 100
-output_dir = "vae_ldm"
+output_dir = "vae_ldm_mid_resolution"
 os.makedirs(output_dir, exist_ok=True)
 
 vae, optimizer, dataloader = accelerator.prepare(vae, optimizer, dataloader)
@@ -84,11 +84,12 @@ for epoch in range(num_epochs):
     for step, batch in enumerate(pbar):
         with accelerator.accumulate(vae):  
             pixel_values = batch["pixel_values"].to(device)
-
+            print(pixel_values.shape)
             # encode/decode
             encode_out = vae.encode(pixel_values)
             latent_dist = encode_out.latent_dist
             z = latent_dist.sample()
+            print(z.shape)
             recon = vae.decode(z).sample
 
             # losses
