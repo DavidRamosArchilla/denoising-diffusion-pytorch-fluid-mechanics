@@ -54,6 +54,37 @@ def divisible_by(numer, denom):
 def l2norm(t, dim = -1, eps = 1e-12):
     return F.normalize(t, dim = dim, eps = eps)
 
+def prob_mask_like(shape, prob, device):
+    if prob == 1:
+        return torch.ones(shape, device = device, dtype = torch.bool)
+    elif prob == 0:
+        return torch.zeros(shape, device = device, dtype = torch.bool)
+    else:
+        return torch.zeros(shape, device = device).float().uniform_(0, 1) < prob
+
+def pack_one_with_inverse(x, pattern):
+    packed, packed_shape = pack([x], pattern)
+
+    def inverse(x, inverse_pattern = None):
+        inverse_pattern = default(inverse_pattern, pattern)
+        return unpack(x, packed_shape, inverse_pattern)[0]
+
+    return packed, inverse
+
+
+def project(x, y):
+    x, inverse = pack_one_with_inverse(x, 'b *')
+    y, _ = pack_one_with_inverse(y, 'b *')
+
+    dtype = x.dtype
+    x, y = x.double(), y.double()
+    unit = F.normalize(y, dim = -1)
+
+    parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
+    orthogonal = x - parallel
+
+    return inverse(parallel).to(dtype), inverse(orthogonal).to(dtype)
+
 # mp activations
 # section 2.5
 
@@ -66,7 +97,7 @@ class MPSiLU(Module):
 class Gain(Module):
     def __init__(self):
         super().__init__()
-        self.gain = nn.Parameter(torch.tensor(0.))
+        self.gain = nn.Parameter(torch.tensor(1.)) # it was previously intiallized with 0
 
     def forward(self, x):
         return x * self.gain
@@ -431,12 +462,13 @@ class KarrasUnet(Module):
         attn_res_mp_add_t = 0.3,
         resnet_mp_add_t = 0.3,
         dropout = 0.1,
-        self_condition = False
+        self_condition = False,
+        cond_drop_prob=0.5        # probability of dropping the condition when training with classifier free guidance
     ):
         super().__init__()
 
         self.self_condition = self_condition
-
+        self.cond_drop_prob = cond_drop_prob
         # determine dimensions
 
         self.channels = channels
@@ -465,10 +497,12 @@ class KarrasUnet(Module):
 
         self.needs_class_labels = exists(num_classes)
         self.num_classes = num_classes
+        self.cond_dim = num_classes
 
         if self.needs_class_labels:
             self.to_class_emb = Linear(num_classes, 4 * dim)
             self.add_class_emb = MPAdd(t = mp_add_emb_t)
+            self.null_classes_emb = nn.Parameter(torch.randn(num_classes))
 
         # final embedding activations
 
@@ -558,16 +592,28 @@ class KarrasUnet(Module):
         self,
         x,
         time,
+        class_labels,
         self_cond = None,
-        class_labels = None
+        cond_drop_prob = None
     ):
         # validate image shape
+        batch, device = x.shape[0], x.device
+        cond_drop_prob = default(cond_drop_prob, self.cond_drop_prob)
 
-        assert x.shape[1:] == (self.channels, self.image_size, self.image_size)
+        # assert x.shape[1:] == (self.channels, self.image_size, self.image_size)
+        classes_emb = class_labels
+        if cond_drop_prob > 0:
+            keep_mask = prob_mask_like((batch,), 1 - cond_drop_prob, device = device)
+            null_classes_emb = repeat(self.null_classes_emb, 'd -> b d', b = batch)
+            classes_emb = torch.where(
+                rearrange(keep_mask, 'b -> b 1'),
+                classes_emb,
+                null_classes_emb
+            )
 
         # self conditioning
-
         if self.self_condition:
+            # print(self_cond)
             self_cond = default(self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((self_cond, x), dim = 1)
         else:
@@ -629,6 +675,41 @@ class KarrasUnet(Module):
         # output block
 
         return self.output_block(x)
+
+    def forward_with_cond_scale(
+        self,
+        x,
+        t,
+        classes,
+        x_self_cond,
+        cond_scale=1,
+        remove_parallel_component=True,
+        rescaled_phi=0.7,
+        keep_parallel_frac=0.
+    ):  
+        # print(x[0])
+        logits = self.forward(x, t, classes, x_self_cond, cond_drop_prob=0.)
+        # print(logits[0])
+        if cond_scale == 1:
+            return logits
+
+        null_logits = self.forward(x, t, classes, x_self_cond, cond_drop_prob=1.)
+        update = logits - null_logits
+
+        if remove_parallel_component:
+            parallel, orthog = project(update, logits)
+            update = orthog + parallel * keep_parallel_frac
+
+        scaled_logits = logits + update * (cond_scale - 1.)
+
+        if rescaled_phi == 0.:
+            return scaled_logits, null_logits
+
+        std_fn = partial(torch.std, dim = tuple(range(1, scaled_logits.ndim)), keepdim = True)
+        rescaled_logits = scaled_logits * (std_fn(logits) / std_fn(scaled_logits))
+        interpolated_rescaled_logits = rescaled_logits * rescaled_phi + scaled_logits * (1. - rescaled_phi)
+
+        return interpolated_rescaled_logits, null_logits
 
 # improvised MP Transformer
 

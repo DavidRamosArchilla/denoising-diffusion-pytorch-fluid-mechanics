@@ -379,7 +379,6 @@ class GraphDiT(nn.Module):
         t = self.t_embedder(t)   
         force_drop_ids = kwargs["force_drop_ids"] if "force_drop_ids" in kwargs else None
         y = self.y_embedder(classes, self.training, force_drop_ids)    # (N, D)
-        # TODO: probar a concatenar en vez de sumar (habra que ajustar las dimensiones)
         c = t + y    
         # ... Transformer Blocks Loop ...
         for block in self.blocks:

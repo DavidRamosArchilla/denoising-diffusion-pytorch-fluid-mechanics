@@ -20,6 +20,8 @@ from timm.models.vision_transformer import PatchEmbed, Mlp # Attention
 from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention, WindowAttention
 from functools import partial
 from . import is_triton_module_available
+# from megablocks.layers.moe import MoE
+# from megablocks.layers.arguments import Arguments
 
 _triton_modules_available = False
 if is_triton_module_available():
@@ -194,6 +196,12 @@ class DiTBlock(nn.Module):
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         if num_experts is not None and num_experts_per_tok is not None:
             self.mlp = SparseMoeBlock(embed_dim=hidden_size, mlp_ratio=mlp_ratio, num_experts=num_experts, num_experts_per_tok=num_experts_per_tok) # SparseMoeBlock
+            # self.mlp = self._create_megablocks_moe(
+            #     hidden_size=hidden_size,
+            #     mlp_hidden_dim=mlp_hidden_dim,
+            #     num_experts=num_experts,
+            #     num_experts_per_tok=num_experts_per_tok
+            # )
         elif use_swiglu:
             self.mlp = SwiGLUFFN(hidden_size, int(2/3 * mlp_hidden_dim), bias=bias)
         else:
@@ -207,7 +215,41 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        
+        # MLP/MoE block
+        mlp_input = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        # TODO: this is for debug
+        # if False and self.is_megablocks:
+        #     # Megablocks MoE expects different input format
+        #     # It returns (output, aux_loss)
+        #     mlp_output, aux_loss = self.mlp(mlp_input)
+        #     # Store aux_loss for later use in training
+        #     if self.training and hasattr(self, 'aux_loss'):
+        #         self.aux_loss += aux_loss
+        # else:
+        #     mlp_output = self.mlp(mlp_input)
+        
+        # x = x + gate_mlp.unsqueeze(1) * mlp_output
+        
         return x
+
+    # def _create_megablocks_moe(self, hidden_size, mlp_hidden_dim, num_experts, num_experts_per_tok):
+    #     """
+    #     Create a Megablocks MoE layer.
+        
+    #     Megablocks uses a different API and requires specific arguments.
+    #     """
+    #     # Create megablocks arguments
+    #     args = Arguments(
+    #         hidden_size=hidden_size,
+    #         ffn_hidden_size=mlp_hidden_dim,
+    #         moe_num_experts=num_experts,
+    #         moe_top_k=num_experts_per_tok,
+    #         moe_capacity_factor=1.0,  # Adjust based on your needs
+    #         moe_loss_weight=0.01,  # Equivalent to aux_loss_alpha
+    #         device=torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
+    #     )        
+    #     return MoE(args)
 
 
 def window_partition(x, window_size):
@@ -310,7 +352,6 @@ class FinalLayer1D(nn.Module):
 #################################################################################
 #                                      MoE                                      #
 #################################################################################
-
 class MoEGate(nn.Module):
     def __init__(self, embed_dim, num_experts=16, num_experts_per_tok=2, aux_loss_alpha=0.01):
         super().__init__()
@@ -589,7 +630,7 @@ class DiT(nn.Module):
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        # nn.init.constant_(self.x_embedder.proj.bias, 0)
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
 
         # Initialize label embedding table:
         nn.init.normal_(self.y_embedder.mlp[0].weight, std=0.02)
@@ -602,13 +643,13 @@ class DiT(nn.Module):
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            # nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
-        # nn.init.constant_(self.final_layer.linear.bias, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
 
     
     def unpatchify(self, x):

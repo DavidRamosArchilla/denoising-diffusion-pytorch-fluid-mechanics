@@ -251,12 +251,15 @@ class ResnetBlock(nn.Module):
         return h + self.res_conv(x)
 
 class LinearAttention(Module):
-    def __init__(self, dim, heads = 4, dim_head = 32):
+    def __init__(self, dim, heads = 4, dim_head = 32, qknorm=False):
         super().__init__()
         self.scale = dim_head ** -0.5
         self.heads = heads
         hidden_dim = dim_head * heads
         self.to_qkv = nn.Conv1d(dim, hidden_dim * 3, 1, bias = False)
+        self.qk_norm = qknorm
+        self.q_norm = nn.RMSNorm(hidden_dim) if qknorm else identity
+        self.k_norm = nn.RMSNorm(hidden_dim) if qknorm else identity
 
         self.to_out = nn.Sequential(
             nn.Conv1d(hidden_dim, dim, 1),
@@ -265,8 +268,25 @@ class LinearAttention(Module):
 
     def forward(self, x):
         b, c, n = x.shape
-        qkv = self.to_qkv(x).chunk(3, dim = 1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) n -> b h c n', h = self.heads), qkv)
+        # qkv = self.to_qkv(x).chunk(3, dim = 1)
+        # q, k, v = map(lambda t: rearrange(t, 'b (h c) n -> b h c n', h = self.heads), qkv)
+        q, k, v = self.to_qkv(x).chunk(3, dim = 1)
+        q = rearrange(q, 'b c n -> b n c') 
+        k = rearrange(k, 'b c n -> b n c')
+        v = rearrange(v, 'b c n -> b n c')
+        # q, k, v = qkv.unbind(1)  # Each is (B, N, C)
+        
+        # Apply normalization BEFORE reshaping into heads
+        dtype = q.dtype
+        if self.qk_norm:
+            q = self.q_norm(q.to(self.q_norm.weight.dtype)).to(dtype)
+            k = self.k_norm(k.to(self.k_norm.weight.dtype)).to(dtype) # (B, N, C)
+        
+        # Now reshape into multi-head format
+        q = rearrange(q, 'b n (h d) -> b h d n', h=self.heads)  # (B, h, d, N)
+        k = rearrange(k, 'b n (h d) -> b h d n', h=self.heads)  # (B, h, d, N)
+        v = rearrange(v, 'b n (h d) -> b h d n', h=self.heads)  # (B, h, d, N)
+
 
         q = q.softmax(dim = -2)
         k = k.softmax(dim = -1)
@@ -280,19 +300,32 @@ class LinearAttention(Module):
         return self.to_out(out)
 
 class Attention(Module):
-    def __init__(self, dim, heads = 4, dim_head = 32):
+    def __init__(self, dim, heads = 4, dim_head = 32, qknorm=False):
         super().__init__()
         self.scale = dim_head ** -0.5
         self.heads = heads
         hidden_dim = dim_head * heads
+        self.qk_norm = qknorm
+        self.q_norm = nn.RMSNorm(hidden_dim) if qknorm else identity
+        self.k_norm = nn.RMSNorm(hidden_dim) if qknorm else identity
 
         self.to_qkv = nn.Conv1d(dim, hidden_dim * 3, 1, bias = False)
         self.to_out = nn.Conv1d(hidden_dim, dim, 1)
 
     def forward(self, x):
         b, c, n = x.shape
-        qkv = self.to_qkv(x).chunk(3, dim = 1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) n -> b h c n', h = self.heads), qkv)
+        # qkv = self.to_qkv(x).chunk(3, dim = 1)
+        # q, k, v = map(lambda t: rearrange(t, 'b (h c) n -> b h c n', h = self.heads), qkv)
+        q, k, v = self.to_qkv(x).chunk(3, dim = 1)
+        q = rearrange(q, 'b c n -> b n c') 
+        k = rearrange(k, 'b c n -> b n c')
+        v = rearrange(v, 'b c n -> b n c')
+        dtype = q.dtype
+        if self.qk_norm:
+            q = self.q_norm(q.to(self.q_norm.weight.dtype)).to(dtype)
+            k = self.k_norm(k.to(self.k_norm.weight.dtype)).to(dtype)
+            
+        q, k, v = map(lambda t: rearrange(t, 'b n (h c) -> b h c n', h = self.heads), (q, k, v))
         out = F.scaled_dot_product_attention(q, k, v) # this outputs (b, h, c, n)
         out = rearrange(out, 'b h c n-> b (h c) n')
 
@@ -361,6 +394,7 @@ class Unet1D(Module):
         attn_dim_head = 32,
         attn_heads = 4,
         full_attn=False,
+        qknorm=False,
         cross_attn=False,
         self_condition = False,
     ):
@@ -412,11 +446,11 @@ class Unet1D(Module):
 
         resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, classes_emb_dim=classes_dim, dropout = dropout)
         if cross_attn:
-            outter_attention = partial(CrossAttention, context_dim=classes_dim, dim_head=attn_dim_head, heads=attn_heads)
+            outter_attention = partial(CrossAttention, context_dim=classes_dim, dim_head=attn_dim_head, heads=attn_heads, qknorm=qknorm)
         elif full_attn:
-            outter_attention = partial(Attention, dim_head=attn_dim_head, heads=attn_heads)
+            outter_attention = partial(Attention, dim_head=attn_dim_head, heads=attn_heads, qknorm=qknorm)
         else:
-            outter_attention = partial(LinearAttention, dim_head=attn_dim_head, heads=attn_heads)
+            outter_attention = partial(LinearAttention, dim_head=attn_dim_head, heads=attn_heads, qknorm=qknorm)
 
         # layers
 
@@ -436,7 +470,7 @@ class Unet1D(Module):
 
         mid_dim = dims[-1]
         self.mid_block1 = resnet_block(mid_dim, mid_dim)
-        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim, dim_head = attn_dim_head, heads = attn_heads)))
+        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim, dim_head = attn_dim_head, heads = attn_heads, qknorm=qknorm)))
         self.mid_block2 = resnet_block(mid_dim, mid_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
@@ -490,8 +524,17 @@ class Unet1D(Module):
         interpolated_rescaled_logits = rescaled_logits * rescaled_phi + scaled_logits * (1. - rescaled_phi)
 
         return interpolated_rescaled_logits
+    
+    def forward_with_dpmsolver(self, x, timestep, y, mask=None, **kwargs):
+        """
+        dpm solver donnot need variance prediction
+        """
+        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
+        model_out = self.forward(x, timestep, y) # mask
+        return model_out.chunk(2, dim=1)[0] if self.learn_sigma else model_out
 
-    def forward(self, x, time, classes, x_self_cond = None, cond_drop_prob=None):
+
+    def forward(self, x, time, classes, x_self_cond = None, cond_drop_prob=None, **kwargs):
 
         batch, device = x.shape[0], x.device
         cond_drop_prob = default(cond_drop_prob, self.cond_drop_prob)
@@ -1123,6 +1166,14 @@ class Trainer1D(object):
             dataloader_config=DataLoaderConfiguration(split_batches=split_batches),
             gradient_accumulation_steps=gradient_accumulate_every,
         )
+        # fsdp_plugin=FSDPPlugin(
+        #     state_dict_type="sharded",
+        #     mixed_precision_policy=MixedPrecision(
+        #         param_dtype=torch.bfloat16,
+        #         reduce_dtype=torch.float32,
+        #         buffer_dtype=torch.bfloat16,
+        #     )
+        # )
 
         # model
 
@@ -1143,9 +1194,9 @@ class Trainer1D(object):
 
         # dataset and dataloader
 
-        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle=True, pin_memory=True, num_workers=4, persistent_workers=True)
+        dl = DataLoader(dataset, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=4, persistent_workers=True)
         if dataset_test is not None:
-            self.dl_test = DataLoader(dataset_test, batch_size = train_batch_size//gradient_accumulate_every//2, shuffle=False, pin_memory=True, num_workers=4)
+            self.dl_test = DataLoader(dataset_test, batch_size = train_batch_size, shuffle=False, pin_memory=True, num_workers=4)
         else:
             self.dl_test = None
 
@@ -1209,7 +1260,7 @@ class Trainer1D(object):
 
         data = {
             'step': self.step,
-            'model': self.accelerator.get_state_dict(self.model),
+            'model': self.accelerator.get_state_dict(self.model), # self.model.state_dict(), #
             # 'opts': [opt.state_dict() for opt in self.opts],
             "opt": self.opt.state_dict(),
             'scheduler': self.scheduler.state_dict() if self.use_lr_scheduler else None,
@@ -1229,8 +1280,15 @@ class Trainer1D(object):
 
         data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device, weights_only=True)
 
-        model = self.accelerator.unwrap_model(self.model)
-        model.load_state_dict(data['model'])
+        # model = self.accelerator.unwrap_model(self.model)
+        # model.load_state_dict(data['model'])
+        state_dict = data['model']
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            # Remove "module." prefix if it exists (or contains it)
+            new_key = key.replace("module.", "") if "module." in key else key
+            new_state_dict[new_key] = value
+        self.model.load_state_dict(new_state_dict)
 
         self.step = data['step']
         # self.opt.load_state_dict(data['opt'])
@@ -1330,8 +1388,8 @@ class Trainer1D(object):
                         self.ema.ema_model.train()
 
                 # if accelerator.sync_gradients:
-                accelerator.wait_for_everyone()
-
+                #     accelerator.wait_for_everyone()
+ 
         if accelerator.is_main_process:
             self.save_loss_plot()
             
