@@ -10,7 +10,7 @@ from einops import rearrange, repeat
 from torch.nn.attention import SDPBackend
 import xformers.ops
 from timm.layers import trunc_normal_
-# constants
+from flash_attn import flash_attn_func
 
 AttentionConfig = namedtuple('AttentionConfig', ['backends'])
 
@@ -176,6 +176,9 @@ class Attention(nn.Module):
                 q, k, v,
                 dropout_p=self.attn_drop.p if self.training else 0.,
             )
+            # flash attn expects qkv to have sgape (B, N, heads, head_dim)
+            # q, k, v = map(lambda w: w.permute(0, 2, 1, 3), (q, k, v))
+            # x = flash_attn_func(q, k, v)
         # elif xformer_attention:
             # xformers expects qkv to have sgape (B, N, heads, head_dim)
             # q, k, v = map(lambda t: t.permute(0, 2, 1, 3).contiguous(), (q, k, v))  # B, N, heads, head_dim
@@ -191,6 +194,7 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
 
 class LinearAttention(nn.Module):
     """
