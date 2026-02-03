@@ -1253,19 +1253,28 @@ class Trainer1D(object):
         return self.accelerator.device
 
     def save(self, milestone):
-        if not self.accelerator.is_local_main_process:
-            return
-
         lr = self.opt.param_groups[0]['lr']
+        # --- FIX STARTS HERE ---
+        # 1. Standard unwrap (removes OptimizedModule if compiled)
+        raw_model = self.accelerator.unwrap_model(self.model)
+        
+        # 2. Manual check: If it's still a DDP module (which happens with torch.compile), 
+        # peel one more layer to avoid the buffer sync deadlock.
+        if isinstance(raw_model, nn.parallel.DistributedDataParallel):
+            raw_model = raw_model.module
+            
+        # 3. Extra safety for deep compilation nesting
+        if hasattr(raw_model, '_orig_mod'):
+            raw_model = raw_model._orig_mod
+        # --- FIX ENDS HERE ---
 
         data = {
             'step': self.step,
-            'model': self.accelerator.get_state_dict(self.model), # self.model.state_dict(), #
-            # 'opts': [opt.state_dict() for opt in self.opts],
-            "opt": self.opt.state_dict(),
+            'model': raw_model.state_dict(), # Now safe to call on Rank 0 only
+            'opt': self.opt.state_dict(),
             'scheduler': self.scheduler.state_dict() if self.use_lr_scheduler else None,
             'ema': self.ema.state_dict(),
-            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+            'scaler': self.accelerator.scaler.state_dict() if self.accelerator.scaler is not None else None,
             'version': __version__,
             'lr': lr,
             'loss_history': torch.tensor(self.loss_history),
@@ -1273,6 +1282,7 @@ class Trainer1D(object):
         }
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+
 
     def load(self, milestone):
         accelerator = self.accelerator
