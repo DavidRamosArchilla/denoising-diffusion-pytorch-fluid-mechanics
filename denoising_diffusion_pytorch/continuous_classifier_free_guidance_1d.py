@@ -1225,9 +1225,9 @@ class Trainer1D(object):
 
         # for logging results in a folder periodically
 
-        if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device, dtype=torch.float32) # 
+        # if self.accelerator.is_main_process:
+        self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
+        self.ema.to(self.device, dtype=torch.float32) # 
 
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
@@ -1252,29 +1252,17 @@ class Trainer1D(object):
     def device(self):
         return self.accelerator.device
 
-    def save(self, milestone):
+    def save(self, milestone, model_state_dict):
         lr = self.opt.param_groups[0]['lr']
-        # --- FIX STARTS HERE ---
-        # 1. Standard unwrap (removes OptimizedModule if compiled)
-        raw_model = self.accelerator.unwrap_model(self.model)
-        
-        # 2. Manual check: If it's still a DDP module (which happens with torch.compile), 
-        # peel one more layer to avoid the buffer sync deadlock.
-        if isinstance(raw_model, nn.parallel.DistributedDataParallel):
-            raw_model = raw_model.module
-            
-        # 3. Extra safety for deep compilation nesting
-        if hasattr(raw_model, '_orig_mod'):
-            raw_model = raw_model._orig_mod
-        # --- FIX ENDS HERE ---
 
         data = {
             'step': self.step,
-            'model': raw_model.state_dict(), # Now safe to call on Rank 0 only
+            'model': model_state_dict,  # Use the passed dictionary
+            # 'opts': [opt.state_dict() for opt in self.opts],
             'opt': self.opt.state_dict(),
             'scheduler': self.scheduler.state_dict() if self.use_lr_scheduler else None,
             'ema': self.ema.state_dict(),
-            'scaler': self.accelerator.scaler.state_dict() if self.accelerator.scaler is not None else None,
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__,
             'lr': lr,
             'loss_history': torch.tensor(self.loss_history),
@@ -1283,22 +1271,22 @@ class Trainer1D(object):
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
-
     def load(self, milestone):
         accelerator = self.accelerator
         device = accelerator.device
 
         data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device, weights_only=True)
-
-        # model = self.accelerator.unwrap_model(self.model)
-        # model.load_state_dict(data['model'])
-        state_dict = data['model']
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            # Remove "module." prefix if it exists (or contains it)
-            new_key = key.replace("module.", "") if "module." in key else key
-            new_state_dict[new_key] = value
-        self.model.load_state_dict(new_state_dict)
+        try:
+            model = self.accelerator.unwrap_model(self.model)
+            model.load_state_dict(data['model'])
+        except:
+            state_dict = data['model']
+            new_state_dict = {}
+            for key, value in state_dict.items():
+                # Remove "module." prefix if it exists (or contains it)
+                new_key = key.replace("module.", "") if "module." in key else key
+                new_state_dict[new_key] = value
+            self.model.load_state_dict(new_state_dict)
 
         self.step = data['step']
         # self.opt.load_state_dict(data['opt'])
@@ -1362,7 +1350,7 @@ class Trainer1D(object):
                         self.scheduler.step()
 
                 # accelerator.wait_for_everyone()
-
+                model_state_dict = accelerator.get_state_dict(self.model)
                 if accelerator.is_main_process and accelerator.sync_gradients:
                     total_loss += loss.detach().float().mean().cpu().item()
                     self.loss_history.append(total_loss)
@@ -1393,7 +1381,7 @@ class Trainer1D(object):
                             all_samples = torch.cat(all_samples_list, dim = 0)
                             self.test_loss_history.append(np.mean(test_losses))
                             torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.pt'))
-                        self.save(milestone)
+                        self.save(milestone, model_state_dict)
                         self.save_loss_plot()
                         self.ema.ema_model.train()
 
@@ -1404,6 +1392,40 @@ class Trainer1D(object):
             self.save_loss_plot()
             
         accelerator.print('training complete')
+    
+    def eval_model(self, dataset_test, batch_size=32, **sampling_kwargs):
+        # Prepare models
+        dl_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=8)
+        model, test_dataloader = self.accelerator.prepare(self.ema.ema_model, dl_test)
+        model.eval()
+       
+        # # Alternative: manually broadcast parameters if Accelerate's prepare didn't sync EMA
+        with torch.no_grad():
+            for param in model.parameters():
+                # Broadcast from rank 0 to all other ranks
+                torch.distributed.broadcast(param.data, src=0)
+        
+        # Wait for broadcast to complete
+        self.accelerator.wait_for_everyone()
+        all_preds = []
+        
+        for data in tqdm(test_dataloader, disable=not self.accelerator.is_main_process):
+            sequence, classes = data[0], data[1]
+            with torch.inference_mode():    
+                # with self.accelerator.autocast():
+                pred = model.sample(classes=classes, **sampling_kwargs)
+                gathered_pred, sequence = self.accelerator.gather_for_metrics((pred, sequence))
+                # gathered_pred = self.accelerator.gather(pred)
+        
+            if self.accelerator.is_main_process:
+                all_preds.append(gathered_pred.cpu())
+            del pred
+            del gathered_pred
+            del classes
+            del sequence
+        if self.accelerator.is_main_process:
+            return torch.cat(all_preds, dim=0)
+        return None
     
     def save_loss_plot(self):
         plt.figure()
