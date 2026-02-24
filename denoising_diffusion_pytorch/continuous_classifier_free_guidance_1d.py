@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.amp import autocast
 from torch.optim import Adam, AdamW
 from torch.utils.data import Dataset, DataLoader
+from torch.profiler import profile, ProfilerActivity, schedule
 
 from einops import rearrange, reduce, repeat, pack, unpack
 from einops.layers.torch import Rearrange
@@ -1127,6 +1128,28 @@ def discretized_gaussian_log_likelihood(x, *, means, log_scales):
 
 
 
+def print_profiler_summary(prof):
+    averages = prof.key_averages()
+    cuda_attr = 'self_device_time_total'
+
+    print("\n=== Top CUDA ops ===")
+    print(averages.table(sort_by=cuda_attr, row_limit=20))
+
+    print("\n=== Communication ops (NCCL) ===")
+    comm_ops = [e for e in averages if "nccl" in e.key.lower() or "allreduce" in e.key.lower()]
+    total_cuda_time = sum(getattr(e, cuda_attr) for e in averages)
+    total_comm_time = sum(getattr(e, cuda_attr) for e in comm_ops)
+
+    for e in sorted(comm_ops, key=lambda x: getattr(x, cuda_attr), reverse=True):
+        print(f"  {e.key:50s}  cuda_time: {getattr(e, cuda_attr)/1e3:.2f} ms")
+
+    if total_cuda_time > 0:
+        print(f"\nTotal CUDA time : {total_cuda_time/1e3:.2f} ms")
+        print(f"Total comm time : {total_comm_time/1e3:.2f} ms  ({100*total_comm_time/total_cuda_time:.1f}%)")
+        print(f"Compute time    : {(total_cuda_time-total_comm_time)/1e3:.2f} ms  ({100*(1-total_comm_time/total_cuda_time):.1f}%)")
+
+    prof.export_chrome_trace("trace_rank.json")    
+
 # trainer class
 
 class Trainer1D(object):
@@ -1308,7 +1331,7 @@ class Trainer1D(object):
         if "test_loss_history" in data:
             self.test_loss_history = data['test_loss_history'].tolist()
         
-        if self.use_lr_scheduler and "scheduler" in data:
+        if self.use_lr_scheduler and "scheduler" in data and self.use_lr_scheduler:
             self.scheduler.load_state_dict(data['scheduler'])
         
         if "lr" in data:
@@ -1316,12 +1339,26 @@ class Trainer1D(object):
             for param_group in self.opt.param_groups:
                 param_group['lr'] = data['lr']
 
-    def train(self):
+    def train(self, do_profiling=False):
         accelerator = self.accelerator
         device = accelerator.device
-
+        profiler = None
+        PROFILE_START_STEP = 25
+        PROFILE_ACTIVE_STEPS = 15 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
             while self.step < self.train_num_steps:
+                if do_profiling and self.step == PROFILE_START_STEP and profiler is None:
+                    profiler = profile(
+                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                        schedule=schedule(wait=0, warmup=1, active=PROFILE_ACTIVE_STEPS, repeat=1),
+                        record_shapes=True,
+                        with_stack=True,
+                        on_trace_ready=print_profiler_summary,
+                    )
+                    profiler.__enter__()
+                    if accelerator.is_main_process:
+                        print(f"[Profiler] Started at step {self.step}")
+
                 self.model.train()
                 total_loss = 0.
                 # for _ in range(self.gradient_accumulate_every):
@@ -1348,84 +1385,102 @@ class Trainer1D(object):
                     self.opt.zero_grad()
                     if self.use_lr_scheduler:
                         self.scheduler.step()
-
+                if profiler is not None:
+                    profiler.step()
+                    if self.step >= PROFILE_START_STEP + PROFILE_ACTIVE_STEPS + 1:  # +1 for warmup
+                        profiler.__exit__(None, None, None)
+                        profiler = None
+                        if accelerator.is_main_process:
+                            print("[Profiler] Done. Stopping training.")
+                        break  # remove this if you want training to continue after profiling
                 # accelerator.wait_for_everyone()
-                model_state_dict = accelerator.get_state_dict(self.model)
-                if accelerator.is_main_process and accelerator.sync_gradients:
-                    total_loss += loss.detach().float().mean().cpu().item()
-                    self.loss_history.append(total_loss)
-                    pbar.set_description(f'loss: {total_loss:.5f}')
-                    pbar.update(1)
-                    self.ema.update()
-
+                if accelerator.sync_gradients:
+                    if accelerator.is_main_process:
+                        total_loss += loss.detach().float().mean().cpu().item()
+                        self.loss_history.append(total_loss)
+                        pbar.set_description(f'loss: {total_loss:.5f}')
+                        pbar.update(1)
+                        self.ema.update()
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
                         self.ema.ema_model.eval()
-                        # with torch.no_grad():
-                        #     milestone = self.step // self.save_and_sample_every
-                        #     random_classes = torch.rand((self.num_samples, self.cond_dim), device=device)
-                        #     batches = torch.split(random_classes, self.batch_size)
-                        #     all_samples_list = list(map(lambda n: self.ema.ema_model.sample(classes=n), batches))
+                        model_state_dict = accelerator.get_state_dict(self.model)
                         milestone = self.step // self.save_and_sample_every
                         if self.dl_test is not None:
-                            all_samples_list = []
-                            with torch.no_grad():
-                                test_losses = []
-                                for data in self.dl_test:
-                                    sequence, classes = data[0].to(device), data[1].to(device)
-                                    with accelerator.autocast():
-                                        pred = self.ema.ema_model.sample(classes=classes)
-                                    all_samples_list.append(pred.float())
-                                    mse = ((pred - sequence) ** 2).mean()
-                                    test_losses.append(mse.cpu().numpy())
+                        #     all_samples_list = []
+                        #     with torch.no_grad():
+                        #         test_losses = []
+                        #         for data in self.dl_test:
+                        #             sequence, classes = data[0].to(device), data[1].to(device)
+                        #             with accelerator.autocast():
+                        #                 pred = self.ema.ema_model.sample(classes=classes)
+                        #             all_samples_list.append(pred.float())
+                        #             mse = ((pred - sequence) ** 2).mean()
+                        #             test_losses.append(mse.cpu().numpy())
 
-                            all_samples = torch.cat(all_samples_list, dim = 0)
-                            self.test_loss_history.append(np.mean(test_losses))
-                            torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.pt'))
-                        self.save(milestone, model_state_dict)
-                        self.save_loss_plot()
-                        self.ema.ema_model.train()
+                        #     all_samples = torch.cat(all_samples_list, dim = 0)
+                            samples, sequences = self.eval_model(self.dl_test.dataset, batch_size=self.batch_size)
+                            if accelerator.is_main_process:
+                                mse = ((samples - sequences) ** 2).mean()
+                                test_losses = mse.cpu().item()
+                                self.test_loss_history.append(test_losses)
+                                torch.save(samples, str(self.results_folder / f'sample-{milestone}.pt'))
 
-                # if accelerator.sync_gradients:
-                #     accelerator.wait_for_everyone()
+                        if accelerator.is_main_process:
+                            self.save(milestone, model_state_dict)
+                            self.save_loss_plot()
+                            self.ema.ema_model.train()
+
+                if accelerator.sync_gradients:
+                    accelerator.wait_for_everyone()
  
         if accelerator.is_main_process:
             self.save_loss_plot()
             
         accelerator.print('training complete')
+        # profiler.__exit__(None, None, None)
     
     def eval_model(self, dataset_test, batch_size=32, **sampling_kwargs):
         # Prepare models
-        dl_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=8)
+        dl_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=4)
+        
+        # Accelerate handles moving the model to the correct device even on 1 GPU
         model, test_dataloader = self.accelerator.prepare(self.ema.ema_model, dl_test)
         model.eval()
        
-        # # Alternative: manually broadcast parameters if Accelerate's prepare didn't sync EMA
-        with torch.no_grad():
-            for param in model.parameters():
-                # Broadcast from rank 0 to all other ranks
-                torch.distributed.broadcast(param.data, src=0)
+        # FIX: Only broadcast if we are in a distributed setup (more than 1 process)
+        if self.accelerator.num_processes > 1:
+            with torch.no_grad():
+                for param in model.parameters():
+                    # Broadcast from rank 0 to all other ranks
+                    torch.distributed.broadcast(param.data, src=0)
+            
+            # Wait for broadcast to complete
+            self.accelerator.wait_for_everyone()
         
-        # Wait for broadcast to complete
-        self.accelerator.wait_for_everyone()
         all_preds = []
+        all_seqs = []
         
         for data in tqdm(test_dataloader, disable=not self.accelerator.is_main_process):
             sequence, classes = data[0], data[1]
             with torch.inference_mode():    
                 # with self.accelerator.autocast():
                 pred = model.sample(classes=classes, **sampling_kwargs)
+                
+                # gather_for_metrics works automatically for both single and multi-GPU
                 gathered_pred, sequence = self.accelerator.gather_for_metrics((pred, sequence))
-                # gathered_pred = self.accelerator.gather(pred)
         
             if self.accelerator.is_main_process:
                 all_preds.append(gathered_pred.cpu())
+                all_seqs.append(sequence.cpu())
+                
             del pred
             del gathered_pred
             del classes
             del sequence
+            
         if self.accelerator.is_main_process:
-            return torch.cat(all_preds, dim=0)
-        return None
+            return torch.cat(all_preds, dim=0), torch.cat(all_seqs, dim=0)
+        return None, None
     
     def save_loss_plot(self):
         plt.figure()
