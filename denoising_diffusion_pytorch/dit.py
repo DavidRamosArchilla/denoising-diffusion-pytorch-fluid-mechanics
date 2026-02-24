@@ -13,21 +13,25 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from einops import repeat, rearrange, pack, unpack
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Mlp # Attention
 from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention, WindowAttention
 from functools import partial
-from . import is_triton_module_available
+from .basic_modules import SwiGLUFFN
+# from . import is_triton_module_available
 # from megablocks.layers.moe import MoE
 # from megablocks.layers.arguments import Arguments
 
-_triton_modules_available = False
-if is_triton_module_available():
+# _triton_modules_available = False
+# if is_triton_module_available():
+try:
     from .fastlinear.modules import TritonLiteMLA, TritonMBConvPreGLU
-
-    _triton_modules_available = True
+except:
+    print("Triton modules not available. TritonLiteMLA and TritonMBConvPreGLU will not be usable.")
+#     _triton_modules_available = True
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -146,29 +150,6 @@ class ConditionEmbedder(nn.Module):
 #                                 Core DiT Model                                #
 #################################################################################
 
-# borrowed from LightningDiT https://github.com/hustvl/LightningDiT/blob/main/models/swiglu_ffn.py
-class SwiGLUFFN(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        hidden_features=None,
-        out_features=None,
-        bias=True,
-    ) -> None:
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.w12 = nn.Linear(in_features, 2 * hidden_features, bias=bias)
-        self.w3 = nn.Linear(hidden_features, out_features, bias=bias)
-
-    @torch.compile
-    def forward(self, x):
-        x12 = self.w12(x)
-        x1, x2 = x12.chunk(2, dim=-1)
-        hidden = F.silu(x1) * x2
-        return self.w3(hidden)
-
-
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
@@ -184,10 +165,10 @@ class DiTBlock(nn.Module):
         elif attn_type == "linear":
             self.attn = LinearAttention(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
         elif attn_type == "triton_linear":
-            if not _triton_modules_available:
-                raise ValueError(
-                    f"{attn_type} type is not available due to _triton_modules_available={_triton_modules_available}."
-                )
+            # if not _triton_modules_available:
+            #     raise ValueError(
+            #         f"{attn_type} type is not available due to _triton_modules_available={_triton_modules_available}."
+            #     )
             # linear self attention with triton kernel fusion
             # TODO: Here the num_heads set to 36 for tmp used
             self.attn = TritonLiteMLA(hidden_size, num_heads=num_heads, eps=1e-8)
@@ -679,6 +660,7 @@ class DiT(nn.Module):
         y = self.y_embedder(classes, self.training, force_drop_ids)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
+            # x = checkpoint(block, x, c, self.feat_rope, use_reentrant=False)
             x = block(x, c, self.feat_rope)                      # (N, T, D)
         act = x
         x = self.final_layer(x, c)               # (B, num_patches, patch_size * out_channels)
