@@ -8,9 +8,9 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat
 from torch.nn.attention import SDPBackend
-import xformers.ops
+# import xformers.ops
 from timm.layers import trunc_normal_
-from flash_attn import flash_attn_func
+# from flash_attn import flash_attn_func
 
 AttentionConfig = namedtuple('AttentionConfig', ['backends'])
 
@@ -170,7 +170,10 @@ class Attention(nn.Module):
         if rope is not None:
             q = rope(q)
             k = rope(k)
-
+        # if i don't do this, it explodes when i compile the model, but only for some configurations 
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q, k, v,
@@ -282,7 +285,7 @@ class WindowAttention(nn.Module):
         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
     """
 
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0., qk_norm=False):
 
         super().__init__()
         self.dim = dim
@@ -295,6 +298,7 @@ class WindowAttention(nn.Module):
         # For 1D, the range of relative positions is [-(W-1), W-1], so we need 2*W - 1 buckets
         self.relative_position_bias_table = nn.Parameter(
             torch.zeros(2 * window_size - 1, num_heads))  # 2*W-1, nH
+        self.pos_bias_scale = nn.Parameter(torch.zeros(1)) 
 
         # Get pair-wise relative position index for each token inside the window
         coords = torch.arange(self.window_size)  # W
@@ -306,6 +310,9 @@ class WindowAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.qk_norm = qk_norm
+        self.q_norm = nn.RMSNorm(head_dim) if qk_norm else nn.Identity()
+        self.k_norm = nn.RMSNorm(head_dim) if qk_norm else nn.Identity()
 
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
@@ -314,35 +321,49 @@ class WindowAttention(nn.Module):
         """
         Args:
             x: input features with shape of (num_windows*B, N, C) 
-               Note: N should equal window_size. 
-               If your data is (B, C, N), you must transpose it to (B, N, C) before passing it here.
             mask: (0/-inf) mask with shape of (num_windows, W, W) or None
         """
         B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+        # qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        # q, k, v = qkv[0], qkv[1], qkv[2]  # (B_, num_heads, N, head_dim)
+        qkv = self.qkv(x).reshape(B_, N, 3, C)
+        q, k, v = qkv.unbind(2)  # Each is (B, N, C)
+        
+        # Now reshape into multi-head format
+        q = rearrange(q, 'b n (h d) -> b h n d', h=self.num_heads)  # (B, h, N, d)
+        k = rearrange(k, 'b n (h d) -> b h n d', h=self.num_heads)  # (B, h, N, d)
+        v = rearrange(v, 'b n (h d) -> b h n d', h=self.num_heads)  # (B, h, N, d)
 
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-
-        # Relative position bias logic adapted for 1D
+        if self.qk_norm:
+            q = self.q_norm(q.to(self.q_norm.weight.dtype))
+            k = self.k_norm(k.to(self.k_norm.weight.dtype)) # (B, N, C)
+            
+        # Prepare relative position bias
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size, self.window_size, -1)  # W, W, nH
-        
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, W, W
-        attn = attn + relative_position_bias.unsqueeze(0)
-
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
-
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        
+        # Combine with window mask if present
+        # if mask is not None:
+        #     nW = mask.shape[0]
+        #     # Expand relative_position_bias for all windows
+        #     attn_mask = relative_position_bias.unsqueeze(0).expand(B_ // nW, -1, -1, -1)  # (B_//nW, nH, W, W)
+        #     # Add window mask (broadcast across heads)
+        #     attn_mask = attn_mask + mask.unsqueeze(0).unsqueeze(1)  # (B_//nW, nW, nH, W, W) -> (B_//nW, 1, 1, W, W)
+        #     attn_mask = attn_mask.view(B_, self.num_heads, N, N)
+        # else:
+        #     # Just use relative position bias
+        #     attn_mask = relative_position_bias.unsqueeze(0)  # (1, nH, W, W)
+        relative_position_bias = relative_position_bias * torch.sigmoid(self.pos_bias_scale)
+        attn_bias = relative_position_bias.expand(B_, -1, -1, -1)
+        # Use PyTorch's fused attention
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_bias,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
+        
+        x = x.transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
