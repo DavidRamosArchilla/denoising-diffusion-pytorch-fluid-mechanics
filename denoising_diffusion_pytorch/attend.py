@@ -10,8 +10,13 @@ from einops import rearrange, repeat
 from torch.nn.attention import SDPBackend
 # import xformers.ops
 from timm.layers import trunc_normal_
-# from flash_attn import flash_attn_func
-
+try: 
+    from flash_attn import flash_attn_func
+    is_flash_attn_available = True
+    print("Flash attention 4 enabled ⚡")
+except:
+    is_flash_attn_available = False
+    print("Flash attention 4 not found, using torch scaled_dot_product")
 AttentionConfig = namedtuple('AttentionConfig', ['backends'])
 
 # helpers
@@ -174,7 +179,19 @@ class Attention(nn.Module):
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
-        if self.fused_attn:
+        if is_flash_attn_available:
+            # FA4 expects (B, N, heads, head_dim) → permute from (B, heads, N, head_dim)
+            q_fa = q.permute(0, 2, 1, 3)  # (B, N, heads, head_dim)
+            k_fa = k.permute(0, 2, 1, 3)
+            v_fa = v.permute(0, 2, 1, 3)
+            x = flash_attn_func(
+                q_fa, k_fa, v_fa,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+                causal=False,
+            )
+            # FA4 returns (B, N, heads, head_dim) → back to (B, heads, N, head_dim)
+            x = x.permute(0, 2, 1, 3)
+        elif self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.attn_drop.p if self.training else 0.,
