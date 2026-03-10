@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
 from accelerate import Accelerator, DataLoaderConfiguration
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from tqdm.auto import tqdm
 
+import numpy as np
 import matplotlib
 matplotlib.use("Agg")   # headless — no display needed
 import matplotlib.pyplot as plt
@@ -74,6 +76,40 @@ class Attention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v) # this outputs (b, h, c, n)
         out = rearrange(out, 'b h c n -> b (h c) n')
         return self.to_out(out)
+
+
+class AttentionV2(nn.Module):
+    def __init__(self, dim, num_heads=4, dim_head=32, qknorm=False):
+        super().__init__()
+        self.heads = num_heads
+        hidden_dim = dim_head * num_heads
+        self.qk_norm = qknorm
+
+        self.q_norm = nn.RMSNorm(dim_head) if qknorm else nn.Identity()  # ← per head-dim, not hidden_dim
+        self.k_norm = nn.RMSNorm(dim_head) if qknorm else nn.Identity()
+
+        self.to_qkv = nn.Conv1d(dim, hidden_dim * 3, 1, bias=False)
+        self.to_out = nn.Conv1d(hidden_dim, dim, 1)
+
+    def forward(self, x):
+        q, k, v = self.to_qkv(x).chunk(3, dim=1)  # each (B, hidden_dim, L)
+
+        # reshape to (B, H, L, HeadDim) — what SDPA expects
+        q, k, v = map(
+            lambda t: rearrange(t, 'b (h c) n -> b h n c', h=self.heads),
+            (q, k, v)
+        )
+
+        if self.qk_norm:
+            dtype = q.dtype
+            q = self.q_norm(q.to(self.q_norm.weight.dtype)).to(dtype)
+            k = self.k_norm(k.to(self.k_norm.weight.dtype)).to(dtype)
+
+        # (B, H, L, HeadDim) — correct layout, SDPA uses HeadDim for scale
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = rearrange(out, 'b h n c -> b (h c) n')
+
+        return x + self.to_out(out)  # ← residual connection restored
 
 
 class Downsample1d(nn.Module):
@@ -264,7 +300,7 @@ class DiagonalGaussian:
     def __init__(self, params: torch.Tensor):
         """params: (B, 2*C, L) — first half is mean, second half is log_var."""
         self.mean, self.log_var = params.chunk(2, dim=1)
-        self.log_var = self.log_var.clamp(-30.0, 20.0)
+        self.log_var = self.log_var.clamp(-15.0, 15.0) # estaba antes en -30, 20
         self.std = (0.5 * self.log_var).exp()
 
     def sample(self) -> torch.Tensor:
@@ -277,6 +313,12 @@ class DiagonalGaussian:
         """KL(q || N(0,I)) per element, summed over C and L, mean over B."""
         return 0.5 * (self.mean.pow(2) + self.log_var.exp() - 1.0 - self.log_var).sum()
 
+    # def kl(self) -> torch.Tensor:
+    #     # Note: Check if you want to sum over the batch dimension or mean.
+    #     # Standard VAEs usually average over the batch dimension for stability.
+    #     # If you sum over batch, the loss grows with batch size, potentially destabilizing training.
+    #     kl_per_element = 0.5 * (self.mean.pow(2) + self.log_var.exp() - 1.0 - self.log_var)
+    #     return kl_per_element.sum() # Or kl_per_element.mean() for more stability
     
 @dataclass
 class AutoencoderKL1dConfig:
@@ -550,11 +592,15 @@ class TrainerVAE1D:
         # ── lr scheduler ──────────────────────────────────────────────────────
         self.use_lr_scheduler = exists(eta_min_scheduler)
         if self.use_lr_scheduler:
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.opt,
-                T_max=train_num_steps,
-                eta_min=eta_min_scheduler,
-            )
+            # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            #     self.opt,
+            #     T_max=train_num_steps,
+            #     eta_min=eta_min_scheduler,
+            # )
+            warmup_steps = 1000
+            warmup = LinearLR(self.opt, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
+            cosine = CosineAnnealingLR(self.opt, T_max=train_num_steps - warmup_steps, eta_min=eta_min_scheduler)
+            self.scheduler = SequentialLR(self.opt, schedulers=[warmup, cosine], milestones=[warmup_steps])
             self.scheduler = self.accelerator.prepare_scheduler(self.scheduler)
 
         # ── results folder ────────────────────────────────────────────────────
@@ -845,3 +891,29 @@ class TrainerVAE1D:
             self._save_loss_plot()
             accelerator.print("Training complete. Saved vae_final.pt + final loss plot.")
         accelerator.wait_for_everyone()
+
+
+def denormalise_latents(z: torch.Tensor, stats_path: str) -> torch.Tensor:
+    """Apply before passing diffusion samples to vae.decode()."""
+    stats = np.load(stats_path)
+    mean  = torch.from_numpy(stats["mean"]).to(z)
+    std   = torch.from_numpy(stats["std"]).to(z)
+    return z * std + mean
+
+@torch.no_grad()
+def decode_latents(
+    vae,
+    z: torch.Tensor,
+    batch_size: int = 8,
+    device: str = "cuda",
+) -> np.ndarray:
+    vae = vae.to(device)
+    vae.eval()
+
+    decoded = []
+    for z_batch in tqdm(z.split(batch_size), desc="Decoding latents"):
+        z_batch = z_batch.to(device)
+        x_hat = vae.decode(z_batch)
+        decoded.append(x_hat.cpu().float())
+
+    return torch.cat(decoded, dim=0)

@@ -10,11 +10,83 @@ import shutil
 import os
 import pandas as pd
 from tqdm.auto import tqdm
+from pathlib import Path
+
 
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 np.random.seed(42)
+
+
+@torch.no_grad()
+def extract_latents(vae, dataset, batch_size=8, device="cuda",
+                    num_workers=4, desc="Extracting latents"):
+    """
+    Encode a dataset to latents using the posterior mean (deterministic).
+    Returns a float32 tensor of shape (N, latent_channels, L_down).
+    """
+    vae.eval()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                        pin_memory=True, num_workers=num_workers)
+    latents = []
+    for batch in tqdm(loader, desc=desc):
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        x = x.to(device)
+        z = vae.encode(x).mode()   # posterior mean — deterministic, no noise
+        latents.append(z.cpu().float())
+
+    return torch.cat(latents, dim=0)   # (N, C_lat, L_down)
+
+@torch.inference_mode()
+def save_latents(vae, dataset_train, dataset_test, save_dir,
+                 batch_size=8, device="cuda", num_workers=4):
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── extract raw latents ───────────────────────────────────────────────────
+    z_train = extract_latents(vae, dataset_train, batch_size, device,
+                              num_workers, desc="Train latents")
+    z_test  = extract_latents(vae, dataset_test,  batch_size, device,
+                              num_workers, desc="Test latents")
+
+    print(f"Train latents: {tuple(z_train.shape)}")
+    print(f"Test  latents: {tuple(z_test.shape)}")
+
+    # ── statistics from train set only, per channel ───────────────────────────
+    # mean/std over (N, L_down), keepdim so shape is (1, C_lat, 1) for broadcasting
+    mean = z_train.mean(dim=(0, 2), keepdim=True)
+    std  = z_train.std(dim=(0, 2),  keepdim=True).clamp(min=1e-6)
+
+    print(f"\nPer-channel stats (train):")
+    for c in range(mean.shape[1]):
+        print(f"  ch {c}:  mean={mean[0,c,0]:.4f}  std={std[0,c,0]:.4f}")
+
+    # ── standardise ───────────────────────────────────────────────────────────
+    z_train_norm = (z_train - mean) / std
+    z_test_norm  = (z_test  - mean) / std   # use TRAIN stats on test
+
+    print(f"\nAfter standardisation:")
+    print(f"  train — mean: {z_train_norm.mean():.6f}  std: {z_train_norm.std():.6f}")
+    print(f"  test  — mean: {z_test_norm.mean():.6f}   std: {z_test_norm.std():.6f}")
+
+    # ── save ──────────────────────────────────────────────────────────────────
+    np.save(save_dir / "latents_train.npy", z_train_norm.numpy())
+    np.save(save_dir / "latents_test.npy",  z_test_norm.numpy())
+    np.savez(save_dir / "latents_stats.npz",
+             mean=mean.numpy(),   # (1, C_lat, 1)
+             std=std.numpy())     # (1, C_lat, 1)
+
+    print(f"\nSaved to {save_dir}/")
+
+
+def denormalise_latents(z: torch.Tensor, stats_path: str) -> torch.Tensor:
+    """Apply before passing diffusion samples to vae.decode()."""
+    stats = np.load(stats_path)
+    mean  = torch.from_numpy(stats["mean"]).to(z)
+    std   = torch.from_numpy(stats["std"]).to(z)
+    return z * std + mean
 
 @torch.no_grad()
 def evaluate_vae(vae, dataset_test, cp_mean, cp_std, results_folder, batch_size=8, device="cuda", num_workers=4, original_length=260774):
@@ -51,7 +123,7 @@ def evaluate_vae(vae, dataset_test, cp_mean, cp_std, results_folder, batch_size=
 
     all_x     = torch.cat(all_x,     dim=0)   # (N, C, P)
     all_x_hat = torch.cat(all_x_hat, dim=0)   # (N, C, P)
-    torch.save(all_x_hat, results_folder + "/resconstructions.pt")
+    torch.save(all_x_hat, results_folder + "/reconstructions.pt")
     # ── per-sample metrics ────────────────────────────────────────────────────
     diff   = all_x - all_x_hat                                   # (N, C, P)
 
@@ -159,7 +231,7 @@ Y_test = (Y_test - train_mean) / train_std
 
 # pad sequences to a multple of a power of 2. 260864 = 256 * 1019
 original_length = Y_train.shape[2]
-pad_length = 260776 # divisible by 8, the downsampling factor of the model
+pad_length = 260784 # 260776 divisible by 8, the downsampling factor of the model, 260784 divisible by 16
 Y_train = F.pad(Y_train, (0, pad_length - nwallp))
 Y_test = F.pad(Y_test, (0, pad_length - nwallp))
 
@@ -176,12 +248,25 @@ cfg = AutoencoderKL1dConfig(
     base_channels=192,
     num_heads=8,
     qk_norm=True,
-    attention_resolutions=[0, 1, 2, 3]
+    attention_resolutions=[0, 1, 2, 3, 4],
+    channel_multipliers=[1, 2, 4, 4, 4],
+    latent_channels=16,
 )
+# cfg = AutoencoderKL1dConfig(
+#     in_channels=4,
+#     base_channels=192,
+#     num_heads=8,
+#     qk_norm=True,
+#     attention_resolutions=[0, 1, 2, 3],
+#     channel_multipliers=[1, 2, 4, 4],
+#     latent_channels=8,
+# )
+
 
 model = AutoencoderKL1d(cfg)
 print("number of parameters in the model: ", model.parameter_count())
-results_folder = './results/vae_onera_full_attn'
+results_folder = './results/vae_onera_full_attn_F16C16_warmup_lr_bf16'
+
 trainer = TrainerVAE1D(
     model,
     dataset_train,
@@ -193,15 +278,15 @@ trainer = TrainerVAE1D(
     results_folder=results_folder,
     save_every=5000,
     train_lr=1e-4,
-    # amlp=True,
-    # mixed_precision_type='bf16',
+    amp=True,
+    mixed_precision_type='bf16',
     max_grad_norm=1.0,
     compile_model=True,
     eta_min_scheduler=1e-6
 )
 
+# trainer.load(results_folder + "/vae_best.pt")
 trainer.train()
-# trainer.load("results/vae_onera/vae_best.pt")
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 # trainer._save_loss_plot()
 
@@ -216,3 +301,5 @@ if trainer.accelerator.is_main_process:
     x_hat      = results["reconstructions"]        # (N, C, P) numpy array
     print(results["global"])  # dict of global scalar metrics
     print(f"Worst R² sample: {r2_scores.min():.4f} (idx {r2_scores.argmin()})")
+    save_latents(vae, dataset_train, dataset_test,
+                 save_dir=results_folder, batch_size=8, device=trainer.device)
