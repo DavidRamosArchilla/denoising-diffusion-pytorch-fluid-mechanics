@@ -20,7 +20,13 @@ from einops import rearrange, reduce, repeat, pack, unpack
 from einops.layers.torch import Rearrange
 
 from accelerate import Accelerator, DataLoaderConfiguration
+from accelerate import FullyShardedDataParallelPlugin
+from torch.distributed.fsdp import ShardingStrategy
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from ema_pytorch import EMA
+
+from contextlib import contextmanager
+from torch.distributed._composable.fsdp import FSDPModule
 
 from tqdm.auto import tqdm
 
@@ -325,10 +331,10 @@ class Attention(Module):
         if self.qk_norm:
             q = self.q_norm(q.to(self.q_norm.weight.dtype)).to(dtype)
             k = self.k_norm(k.to(self.k_norm.weight.dtype)).to(dtype)
-            
+        # n y c ESTAN AL REVES AQUI, PERO FUNCIONA MEJOR ¿?
         q, k, v = map(lambda t: rearrange(t, 'b n (h c) -> b h c n', h = self.heads), (q, k, v))
         out = F.scaled_dot_product_attention(q, k, v) # this outputs (b, h, c, n)
-        out = rearrange(out, 'b h c n-> b (h c) n')
+        out = rearrange(out, 'b h c n -> b (h c) n')
 
         # replace this with flash attention
         # q = q * self.scale
@@ -1150,8 +1156,19 @@ def print_profiler_summary(prof):
 
     prof.export_chrome_trace("trace_rank.json")    
 
-# trainer class
 
+@contextmanager
+def unsharded(model):
+    fsdp_modules = [m for m in model.modules() if isinstance(m, FSDPModule)]
+    for m in fsdp_modules:
+        m.unshard(async_op=False)
+    try:
+        yield
+    finally:
+        for m in fsdp_modules:
+            m.reshard()
+
+# trainer class
 class Trainer1D(object):
     def __init__(
         self,
@@ -1183,11 +1200,20 @@ class Trainer1D(object):
         # accelerator
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        fsdp_plugin = FullyShardedDataParallelPlugin(
+            fsdp_version=2,
+            reshard_after_forward=True,  # HYBRID_SHARD equivalent in FSDP2
+            mixed_precision_policy=MixedPrecisionPolicy(
+                # param_dtype=torch.bfloat16,   # all-gather in bf16
+                reduce_dtype=torch.float32,   # reduce-scatter in fp32
+            ),
+        )
         self.accelerator = Accelerator(
             mixed_precision = mixed_precision_type if amp else 'no',
             cpu=use_cpu,
             dataloader_config=DataLoaderConfiguration(split_batches=split_batches),
             gradient_accumulation_steps=gradient_accumulate_every,
+            # fsdp_plugin=fsdp_plugin
         )
         # fsdp_plugin=FSDPPlugin(
         #     state_dict_type="sharded",
@@ -1395,12 +1421,16 @@ class Trainer1D(object):
                         break  # remove this if you want training to continue after profiling
                 # accelerator.wait_for_everyone()
                 if accelerator.sync_gradients:
+                    with unsharded(self.model):
+                        if self.accelerator.is_main_process:
+                            self.ema.update()
                     if accelerator.is_main_process:
                         total_loss += loss.detach().float().mean().cpu().item()
                         self.loss_history.append(total_loss)
                         pbar.set_description(f'loss: {total_loss:.5f}')
                         pbar.update(1)
-                        self.ema.update()
+                        # with unsharded(self.model):
+                        #     self.ema.update()
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
                         self.ema.ema_model.eval()
                         model_state_dict = accelerator.get_state_dict(self.model)

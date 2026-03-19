@@ -915,7 +915,7 @@ class Trainer:
         num_samples = 25,
         results_folder = './results',
         amp = False,
-        mixed_precision_type = 'fp16',
+        mixed_precision_type = 'bf16',
         split_batches = True,
         convert_image_to = None,
         calculate_fid = True,
@@ -924,7 +924,8 @@ class Trainer:
         num_fid_samples = 50000,
         save_best_and_latest_only = False,
         use_cpu=False,
-        use_lr_scheduler=True
+        use_lr_scheduler=True,
+        compile_model=False
     ):
         super().__init__()
 
@@ -1002,6 +1003,12 @@ class Trainer:
         # prepare model, dataloader, optimizer with accelerator
         self.cond_dim = diffusion_model.cond_dim
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        if compile_model:
+            print("Compiling model...")
+            self.model = torch.compile(self.model) # mode="reduce-overhead"
+            # self.model.neural_net = torch.compile(self.model.neural_net) # mode="reduce-overhead"
+            print("Model compiled")
+
         if use_lr_scheduler:
             self.scheduler = self.accelerator.prepare(self.scheduler)
 

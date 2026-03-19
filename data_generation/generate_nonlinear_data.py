@@ -206,7 +206,7 @@ class AnalyticalFunctionDataset:
 # Example usage
 if __name__ == "__main__":
     # Initialize generator
-    generator = AnalyticalFunctionDataset(nx=512, ny=512, x_range=(0, 2*np.pi), y_range=(0, 2*np.pi))
+    generator = AnalyticalFunctionDataset(nx=64, ny=64, x_range=(0, 2*np.pi), y_range=(0, 2*np.pi))
     
     # Method 1: Random sampling
     print("\n" + "="*50)

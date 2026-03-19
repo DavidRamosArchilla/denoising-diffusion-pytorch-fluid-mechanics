@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import TensorDataset
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance import Unet, GaussianDiffusion, Trainer, evaluate_model
 from denoising_diffusion_pytorch.karras_unet import KarrasUnet
+from denoising_diffusion_pytorch.dit import DiT_models, DiT
 import shutil
 import os
 import matplotlib.pyplot as plt
@@ -41,26 +42,36 @@ extrapolation_parameters = (extrapolation_parameters - parameters_mean) / (param
 
 dataset = TensorDataset(torch.tensor(data, dtype=torch.float32), torch.tensor(parameters, dtype=torch.float32))
 test_dataset = TensorDataset(torch.tensor(test_data, dtype=torch.float32), torch.tensor(test_parameters, dtype=torch.float32))
+# (B, 1, 64, 64), (B, 2)
 
-# model = Unet(
-#     dim = 128,
-#     dim_mults = (1, 2, 4),#, 8),
-#     # flash_attn = False,
-#     channels = 4, # 4 for the latent representations
-#     cond_dim=2,
-#     # full_attn = False
-# )
-
-model = KarrasUnet(
-    image_size=64,
-    dim=64,
-    # dim_mults=(1, 2, 4),  # , 8),
+# para usar la unet
+model = Unet(
+    dim = 128,
+    dim_mults = (1, 2, 4),#, 8),
     # flash_attn = False,
-    channels=1,  
-    num_classes=2,
-    self_condition=True,
+    channels = 1, # 4 for the latent representations
+    cond_dim=2,
     # full_attn = False
 )
+
+# para usar el transformer
+# model = DiT(
+#     depth=14,
+#     hidden_size=896,
+#     patch_size=1,
+#     num_heads=14,
+#     input_size=latents_train.shape[2],
+#     cond_dim=dataset_train.tensors[1].shape[1],
+#     class_dropout_prob=0.2,
+#     in_channels=dataset_train.tensors[0].shape[1],
+#     learn_sigma=False,
+#     use_swiglu=True,
+#     attn_type="linear", # linear vanilla triton_linear
+#     qk_norm=True, # to avoid stability issues with bf16
+#     mlp_ratio=2.5,
+#     # num_experts=4,
+#     # num_experts_per_tok=2
+# )
 
 diffusion = GaussianDiffusion(
     model,
@@ -71,6 +82,21 @@ diffusion = GaussianDiffusion(
     timesteps=1000,    # number of steps
     # use_cfg_plus_plus=True
 )
+# funciona un poco mejor [Flow matching]
+# sampler = Sampler(transport=create_transport(
+#     # use_cosine_loss=True,
+#     # use_lognorm=True
+# ))
+
+# diffusion = FlowMatching(
+#     sampler,
+#     model,
+#     input_size=dataset.tensors[0].shape[2],
+#     cond_scale=2,
+#     num_sampling_steps=400,
+#     sampling_method="euler",
+#     # shifted_mu=1.0986
+# )
 
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
@@ -88,7 +114,8 @@ trainer = Trainer(
     train_num_steps = 30004,         # total training steps
     gradient_accumulate_every = 4,    # gradient accumulation steps
     ema_decay = 0.995,                # exponential moving average decay
-    # amp = True,                       # turn on mixed precision
+    # amp = True,                       # turn on mixed precision to make it faster
+    # mixed_precision_type = 'bf16',
     calculate_fid = False,              # whether to calculate fid during training
     results_folder = results_folder,  # folder to save results to
     save_and_sample_every=2000,

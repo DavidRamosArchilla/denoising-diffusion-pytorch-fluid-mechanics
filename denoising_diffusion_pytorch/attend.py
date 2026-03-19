@@ -11,7 +11,7 @@ from torch.nn.attention import SDPBackend
 # import xformers.ops
 from timm.layers import trunc_normal_
 try: 
-    from flash_attn import flash_attn_func
+    from flash_attn.cute import flash_attn_func
     is_flash_attn_available = True
     print("Flash attention 4 enabled ⚡")
 except:
@@ -184,9 +184,9 @@ class Attention(nn.Module):
             q_fa = q.permute(0, 2, 1, 3)  # (B, N, heads, head_dim)
             k_fa = k.permute(0, 2, 1, 3)
             v_fa = v.permute(0, 2, 1, 3)
-            x = flash_attn_func(
+            x, *_ = flash_attn_func(
                 q_fa, k_fa, v_fa,
-                dropout_p=self.attn_drop.p if self.training else 0.,
+                # dropout_p=self.attn_drop.p if self.training else 0.,
                 causal=False,
             )
             # FA4 returns (B, N, heads, head_dim) → back to (B, heads, N, head_dim)

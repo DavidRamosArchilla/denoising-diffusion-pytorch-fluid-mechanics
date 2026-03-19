@@ -28,7 +28,7 @@ from .basic_modules import SwiGLUFFN
 # _triton_modules_available = False
 # if is_triton_module_available():
 try:
-    from .fastlinear.modules import TritonLiteMLA, TritonMBConvPreGLU
+    from .fastlinear.modules import TritonLiteMLA
 except:
     print("Triton modules not available. TritonLiteMLA and TritonMBConvPreGLU will not be usable.")
 #     _triton_modules_available = True
@@ -183,6 +183,7 @@ class DiTBlock(nn.Module):
             #     num_experts=num_experts,
             #     num_experts_per_tok=num_experts_per_tok
             # )
+            # self.is_megablocks = True
         elif use_swiglu:
             self.mlp = SwiGLUFFN(hidden_size, int(2/3 * mlp_hidden_dim), bias=bias)
         else:
@@ -195,12 +196,16 @@ class DiTBlock(nn.Module):
     def forward(self, x, c, feat_rope=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        x = x.contiguous()
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp)) # esto reemplazaria mlp
         
         # MLP/MoE block
-        mlp_input = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        # TODO: this is for debug
-        # if False and self.is_megablocks:
+        # mlp_input = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        # # wihtou this, cuda can explode
+        # mlp_input = mlp_input.contiguous().to(torch.bfloat16)
+        # print(mlp_input.dtype)
+        # print(f"Expert weights dtype: {next(self.mlp.experts.parameters()).dtype}")
+        # if self.is_megablocks:
         #     # Megablocks MoE expects different input format
         #     # It returns (output, aux_loss)
         #     mlp_output, aux_loss = self.mlp(mlp_input)
@@ -226,11 +231,17 @@ class DiTBlock(nn.Module):
     #         ffn_hidden_size=mlp_hidden_dim,
     #         moe_num_experts=num_experts,
     #         moe_top_k=num_experts_per_tok,
+    #         shared_expert=True,
+    #         shared_expert_hidden_size=hidden_size,
     #         moe_capacity_factor=1.0,  # Adjust based on your needs
     #         moe_loss_weight=0.01,  # Equivalent to aux_loss_alpha
-    #         device=torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
+    #         device=torch.cuda.current_device() if torch.cuda.is_available() else 'cpu',
+    #         mlp_impl="grouped", 
+    #         bf16=True,
+    #         fp16=False
+    #         # moe_expert_model_parallelism=True
     #     )        
-    #     return MoE(args)
+    #     return MoE(args).to(torch.bfloat16)
 
 
 def window_partition(x, window_size):
@@ -357,7 +368,7 @@ class MoEGate(nn.Module):
         bsz, seq_len, h = hidden_states.shape    
         # print(bsz, seq_len, h)    
         ### compute gating score
-        hidden_states = hidden_states.view(-1, h)
+        hidden_states = hidden_states.reshape(-1, h)
         logits = F.linear(hidden_states, self.weight, None)
         if self.scoring_func == 'softmax':
             scores = logits.softmax(dim=-1)
@@ -870,6 +881,11 @@ def DiT_XS_4(**kwargs):
 def DiT_XS_8(**kwargs):
     return DiT(depth=8, hidden_size=256, patch_size=8, num_heads=4, **kwargs)
 
+def DiT_XXS_1(**kwargs):
+    return DiT(depth=6, hidden_size=128, patch_size=1, num_heads=4, **kwargs)
+
+def DiT_XXXS_1(**kwargs):
+    return DiT(depth=4, hidden_size=128, patch_size=1, num_heads=4, **kwargs)
 
 DiT_models = {
     'DiT-XL/2': DiT_XL_2,  'DiT-XL/1': DiT_XL_1,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
@@ -877,4 +893,5 @@ DiT_models = {
     'DiT-B/2':  DiT_B_2,   'DiT-B/1':  DiT_B_1,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
     'DiT-S/2':  DiT_S_2,   'DiT-S/1':  DiT_S_1,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
     'DiT-XS/1': DiT_XS_1,  'DiT-XS/2': DiT_XS_2,  'DiT-XS/4': DiT_XS_4,  'DiT-XS/8': DiT_XS_8,
+    'DiT-XXS/1': DiT_XXS_1, 'DiT-XXXS/1': DiT_XXXS_1
 }
