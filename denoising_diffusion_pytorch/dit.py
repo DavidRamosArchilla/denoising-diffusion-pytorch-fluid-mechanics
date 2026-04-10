@@ -18,7 +18,7 @@ from einops import repeat, rearrange, pack, unpack
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Mlp # Attention
-from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention, WindowAttention
+from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention, WindowAttention, CrossAttention, LinearCrossAttention
 from functools import partial
 from .basic_modules import SwiGLUFFN
 # from . import is_triton_module_available
@@ -197,7 +197,7 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
         x = x.contiguous()
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp)) # esto reemplazaria mlp
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         
         # MLP/MoE block
         # mlp_input = modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -748,6 +748,162 @@ class DiT(nn.Module):
 
         # return interpolated_rescaled_logits, null_logits
 
+class DiTCoordPE(DiT):
+    def __init__(self, coords, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.coord_embedder = CoordEmbedder(self.pos_embed.shape[-1], coords.shape[-1], num_frequencies=32)
+        # self.coords = coords
+        self.register_buffer("coords", coords.unsqueeze(0)) # (1, N, C)
+
+    def forward(self, x, t, classes, return_act=False, *args, **kwargs):
+        x = self.x_embedder(x) + self.coord_embedder(self.coords)
+        t = self.t_embedder(t)
+        force_drop_ids = kwargs.get("force_drop_ids", None)
+        y = self.y_embedder(classes, self.training, force_drop_ids)
+        c = t + y
+        for block in self.blocks:
+            x = block(x, c, self.feat_rope)
+        act = x
+        x = self.final_layer(x, c)
+        x = self.unpatchify(x)
+        if return_act:
+            return x, act
+        return x
+
+class DiTBlockMultiShape(nn.Module):
+    """
+    In Sana implementation they use cross attn + self attn. TODO: consider this approach too
+    """
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, bias=True, use_swiglu=False, attn_type="vanilla", qk_norm=False, num_experts=None, num_experts_per_tok=None):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=bias)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=bias)
+        if attn_type == "vanilla":
+            self.self_attn = Attention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm)
+            self.cross_attn = CrossAttention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm)
+        elif attn_type == "linear":
+            self.self_attn = LinearAttention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm)
+            self.cross_attn = LinearCrossAttention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm)
+        else:
+            raise ValueError(f"Unsupported attention type for DiTMultiShape: {attn_type}")
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        if use_swiglu:
+            self.mlp = SwiGLUFFN(hidden_size, int(2/3 * mlp_hidden_dim), bias=bias)
+        else:
+            self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0, bias=bias)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=bias)
+        )
+
+    def forward(self, x, c, context, feat_rope=None, mask=None):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        x = modulate(self.norm1(x), shift_msa, scale_msa)
+        attn_out = self.self_attn(x, rope=feat_rope, mask=mask)
+        x = x + gate_msa.unsqueeze(1) * attn_out
+        x = x + self.cross_attn(x, context, mask=mask)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+class DiTMultiShape(DiT):
+    def __init__(self, context_channels, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # input size here should me max_input_size, which is the max sequence length among all shapes. However, the input_size of this patcher is useless
+        self.context_embedder = PatchEmbed1D(
+            kwargs["input_size"], kwargs["patch_size"], context_channels, kwargs["hidden_size"]
+        )
+        self.coord_embedder = CoordEmbedder(kwargs.get("hidden_size", 512), context_channels, num_frequencies=32)
+        self.blocks = nn.ModuleList(
+            [
+                DiTBlockMultiShape(
+                    kwargs.get("hidden_size", 512),
+                    kwargs["num_heads"],
+                    mlp_ratio=kwargs.get("mlp_ratio", 4.0),
+                    bias=kwargs.get("use_bias", True),
+                    use_swiglu=kwargs.get("use_swiglu", False),
+                    attn_type=kwargs.get("attn_type", "vanilla"),
+                    qk_norm=kwargs.get("qk_norm", False),
+                    num_experts=kwargs.get("num_experts", None),
+                    num_experts_per_tok=kwargs.get("num_experts_per_tok", None),
+                )
+                for _ in range(kwargs["depth"])
+            ]
+        )
+        self.initialize_weights()
+        
+    def forward(self, x, t, classes, context, mask=None, return_act=False, *args, **kwargs):
+        coord_embed = self.coord_embedder(context.transpose(1, 2))
+        x = self.x_embedder(x) + coord_embed #+ self.pos_embed coord_embed
+        context = self.context_embedder(context) + coord_embed
+        t = self.t_embedder(t)
+        force_drop_ids = kwargs.get("force_drop_ids", None)
+        y = self.y_embedder(classes, self.training, force_drop_ids)
+        c = t + y
+        for block in self.blocks:
+            x = block(x, c, context, self.feat_rope, mask)
+        act = x
+        x = self.final_layer(x, c)
+        x = self.unpatchify(x)
+        if return_act:
+            return x, act
+        return x    
+
+    def forward_with_cond_scale(
+        self,
+        x,
+        t,
+        classes,
+        context,
+        mask=None,
+        cond_scale=6,
+        rescaled_phi=0.7,
+        remove_parallel_component=True,
+        keep_parallel_frac=0,
+        cfg_interval_start=0,
+        *args,
+        **kwargs,
+    ):
+        batch_size = x.shape[0]
+        combined = torch.cat([x, x], dim=0)
+        force_drop_ids = torch.cat(
+            [
+                torch.zeros((batch_size,), dtype=torch.bool, device=x.device),
+                torch.ones((batch_size,), dtype=torch.bool, device=x.device),
+            ],
+            dim=0,
+        )
+        y_combined = torch.cat([classes, classes], dim=0)
+        t_combined = torch.cat([t, t], dim=0)
+        context_combined = torch.cat([context, context], dim=0)
+        mask_combined = None
+        if mask is not None:
+            mask_combined = torch.cat([mask, mask], dim=0)
+        model_out = self.forward(combined, t_combined, y_combined, context_combined, mask_combined, force_drop_ids=force_drop_ids)
+        
+        eps, rest = model_out[:, :self.channels], model_out[:, self.channels:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        update = cond_eps - uncond_eps
+        if remove_parallel_component:
+            parallel, orthog = project(update, cond_eps)
+            update = orthog + parallel * keep_parallel_frac
+        half_eps = cond_eps + update * (cond_scale - 1)
+
+        if cfg_interval_start > 0:
+            timestep = t[0]
+            if timestep < cfg_interval_start:
+                half_eps = cond_eps
+
+        if rescaled_phi != 0:
+            std_fn = partial(torch.std, dim = tuple(range(1, half_eps.ndim)), keepdim = True)
+            rescaled_logits = half_eps * (std_fn(cond_eps) / std_fn(half_eps))
+            half_eps = rescaled_logits * rescaled_phi + half_eps * (1. - rescaled_phi)
+
+        eps = torch.cat([half_eps, uncond_eps], dim=0)
+        eps_sigma = torch.cat([eps, rest], dim=1)
+        # return cfg eps, but not the unconditioned eps 
+        return eps_sigma.chunk(2, dim=0)[0]
 
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #
@@ -816,6 +972,35 @@ def get_1d_sincos_pos_embed(embed_dim, length):
     pos = np.arange(length, dtype=np.float32)
     return get_1d_sincos_pos_embed_from_grid(embed_dim, pos)
 
+def fourier_encode(coords, num_frequencies=32):
+    """
+    coords: (N, C) where C is 2 or 3
+    out: (N, C * 2 * num_frequencies)
+    """
+    freqs = 2.0 ** torch.arange(num_frequencies, device=coords.device)  # (F,)
+    x = coords.unsqueeze(-1) * freqs * 2 * np.pi  # (N, C, F)
+    enc = torch.cat([torch.sin(x), torch.cos(x)], dim=-1)  # (N, C, 2F)
+    return enc.flatten(-2)  # (N, C * 2F)
+
+
+class CoordEmbedder(nn.Module):
+    def __init__(self, embed_dim, coord_dim=3, num_frequencies=32):
+        super().__init__()
+        in_dim = coord_dim * 2 * num_frequencies
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+    def forward(self, coords):
+        """
+        coords: (B, N, C) where C is 2 or 3
+        out: (B, N, embed_dim)
+        """
+        enc = fourier_encode(coords.flatten(0, 1))      # (B*N, C*2F)
+        emb = self.mlp(enc)                              # (B*N, embed_dim)
+        return emb.view(*coords.shape[:2], -1)           # (B, N, embed_dim)
 
 #################################################################################
 #                                   DiT Configs                                  #
@@ -884,6 +1069,15 @@ def DiT_XS_8(**kwargs):
 def DiT_XXS_1(**kwargs):
     return DiT(depth=6, hidden_size=128, patch_size=1, num_heads=4, **kwargs)
 
+def DiT_XXS_2(**kwargs):
+    return DiT(depth=6, hidden_size=128, patch_size=2, num_heads=4, **kwargs)
+
+def DiT_XXS_4(**kwargs):
+    return DiT(depth=6, hidden_size=128, patch_size=4, num_heads=4, **kwargs)
+
+def DiT_XXS_8(**kwargs):
+    return DiT(depth=6, hidden_size=128, patch_size=8, num_heads=4, **kwargs)
+
 def DiT_XXXS_1(**kwargs):
     return DiT(depth=4, hidden_size=128, patch_size=1, num_heads=4, **kwargs)
 
@@ -893,5 +1087,6 @@ DiT_models = {
     'DiT-B/2':  DiT_B_2,   'DiT-B/1':  DiT_B_1,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
     'DiT-S/2':  DiT_S_2,   'DiT-S/1':  DiT_S_1,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
     'DiT-XS/1': DiT_XS_1,  'DiT-XS/2': DiT_XS_2,  'DiT-XS/4': DiT_XS_4,  'DiT-XS/8': DiT_XS_8,
-    'DiT-XXS/1': DiT_XXS_1, 'DiT-XXXS/1': DiT_XXXS_1
+    'DiT-XXS/1': DiT_XXS_1, 'DiT-XXS/2': DiT_XXS_2, 'DiT-XXS/4': DiT_XXS_4, 'DiT-XXS/8': DiT_XXS_8,
+    'DiT-XXXS/1': DiT_XXXS_1
 }

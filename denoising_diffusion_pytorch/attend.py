@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat
 from torch.nn.attention import SDPBackend
+import torch.distributed as dist
 # import xformers.ops
 from timm.layers import trunc_normal_
 try: 
@@ -161,7 +162,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
         
-    def forward(self, x: torch.Tensor, rope=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope=None, mask=None) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4) # 3, B, heads, N, head_dim
         q, k, v = qkv.unbind(0)
@@ -184,10 +185,14 @@ class Attention(nn.Module):
             q_fa = q.permute(0, 2, 1, 3)  # (B, N, heads, head_dim)
             k_fa = k.permute(0, 2, 1, 3)
             v_fa = v.permute(0, 2, 1, 3)
+            def mask_mod(b, h, q_idx, kv_idx):
+                return mask[b, h, q_idx, kv_idx]
+            
             x, *_ = flash_attn_func(
                 q_fa, k_fa, v_fa,
                 # dropout_p=self.attn_drop.p if self.training else 0.,
                 causal=False,
+                mask_mod=mask_mod if mask is not None else None
             )
             # FA4 returns (B, N, heads, head_dim) → back to (B, heads, N, head_dim)
             x = x.permute(0, 2, 1, 3)
@@ -195,6 +200,7 @@ class Attention(nn.Module):
             x = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.attn_drop.p if self.training else 0.,
+                attn_mask=mask
             )
             # flash attn expects qkv to have sgape (B, N, heads, head_dim)
             # q, k, v = map(lambda w: w.permute(0, 2, 1, 3), (q, k, v))
@@ -216,6 +222,106 @@ class Attention(nn.Module):
         return x
 
 
+class CrossAttention(nn.Module):
+    """
+    Cross-Attention module: queries from x, keys/values from context.
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        attn_drop: float = 0.,
+        proj_drop: float = 0.,
+        proj_bias: bool = True,
+        fused_attn: bool = True,
+        context_dim: int = None,  # if None, defaults to dim (symmetric)
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.fused_attn = fused_attn
+
+        context_dim = context_dim or dim  # allows asymmetric query/context dims
+
+        # q only attends to x, k/v project from context
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(context_dim, dim * 2, bias=qkv_bias)
+
+        self.qk_norm = qk_norm
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(
+        self,
+        x: torch.Tensor,          # (B, N_q, C)        — query source
+        context: torch.Tensor,    # (B, N_kv, C_ctx)   — key/value source
+        rope=None,                # optional RoPE, applied to q and k
+        mask=None,                # optional mask (B, heads, N_q, N_kv) or broadcastable
+    ) -> torch.Tensor:
+        B, N_q, C = x.shape
+        B, N_kv, _ = context.shape
+
+        q = self.q(x).reshape(B, N_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, heads, N_q, head_dim)
+        kv = self.kv(context).reshape(B, N_kv, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)  # (2, B, heads, N_kv, head_dim)
+        k, v = kv.unbind(0)
+
+        dtype = q.dtype
+        if self.qk_norm:
+            q = self.q_norm(q.to(self.q_norm.weight.dtype)).to(dtype)
+            k = self.k_norm(k.to(self.k_norm.weight.dtype)).to(dtype)
+
+        if rope is not None:
+            q = rope(q)
+            k = rope(k)
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        if is_flash_attn_available:
+            q_fa = q.permute(0, 2, 1, 3)  # (B, N_q, heads, head_dim)
+            k_fa = k.permute(0, 2, 1, 3)  # (B, N_kv, heads, head_dim)
+            v_fa = v.permute(0, 2, 1, 3)
+
+            def mask_mod(b, h, q_idx, kv_idx):
+                return mask[b, kv_idx]
+
+            x, *_ = flash_attn_func(
+                q_fa, k_fa, v_fa,
+                # dropout_p=self.attn_drop.p if self.training else 0.,
+                causal=False,  # causal makes no sense for cross-attention
+                mask_mod=mask_mod if mask is not None else None,
+            )
+            x = x.permute(0, 2, 1, 3)  # (B, heads, N_q, head_dim)
+
+        elif self.fused_attn:
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+                attn_mask=mask[:, None, None, :] if mask is not None else None  # broadcast mask to (B, heads, N_q, N_kv)
+            )
+
+        else:
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)  # (B, heads, N_q, N_kv)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v                    # (B, heads, N_q, head_dim)
+
+        x = x.transpose(1, 2).reshape(B, N_q, C)  # N_q, not N — sequence length of the query
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+    
+
 class LinearAttention(nn.Module):
     """
     A possible formulation can be found on https://arxiv.org/pdf/2503.16726
@@ -227,7 +333,7 @@ class LinearAttention(nn.Module):
         self.scale = self.dim_head ** -0.5
         self.heads = num_heads
         # TODO: temporary left qkv_bias unused
-        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.qk_norm = qk_norm
         self.q_norm = nn.RMSNorm(dim) if qk_norm else nn.Identity()
         self.k_norm = nn.RMSNorm(dim) if qk_norm else nn.Identity()
@@ -236,9 +342,9 @@ class LinearAttention(nn.Module):
             # nn.RMSNorm(dim),
         )
     
-    def forward(self, x, rope=None):
+    def forward(self, x, rope=None, mask=None):
         B, N, C = x.shape  # batch, sequence, channels
-        qkv = self.to_qkv(x).reshape(B, N, 3, C)
+        qkv = self.qkv(x).reshape(B, N, 3, C)
         q, k, v = qkv.unbind(2)  # Each is (B, N, C)
         
         # Apply normalization BEFORE reshaping into heads
@@ -250,6 +356,10 @@ class LinearAttention(nn.Module):
         q = rearrange(q, 'b n (h d) -> b h d n', h=self.heads)  # (B, h, d, N)
         k = rearrange(k, 'b n (h d) -> b h d n', h=self.heads)  # (B, h, d, N)
         v = rearrange(v, 'b n (h d) -> b h d n', h=self.heads)  # (B, h, d, N)
+
+        if rope is not None:
+            q = rope(q)
+            k = rope(k)
 
         # use the relu approach https://export.arxiv.org/pdf/2410.10629
         q = F.relu(q, inplace=False)
@@ -270,6 +380,74 @@ class LinearAttention(nn.Module):
         # out /= self.scale
         out = rearrange(out, 'b h d n -> b n (h d)')  # (B, N, C)
         return self.proj(out)
+
+
+class LinearCrossAttention(nn.Module):
+    """
+    Cross-attention variant of LinearAttention.
+    Queries from x, keys/values from context.
+    """
+    def __init__(self, dim, num_heads=4, qkv_bias=False, proj_bias=True, qk_norm=False, context_dim=None, **kwargs):
+        super().__init__()
+        assert dim % num_heads == 0, 'dimension must be divisible by number of heads'
+        self.dim_head = dim // num_heads
+        self.scale = self.dim_head ** -0.5
+        self.heads = num_heads
+
+        context_dim = context_dim or dim
+
+        self.q = nn.Linear(dim, dim, bias=False)
+        self.kv = nn.Linear(context_dim, dim * 2, bias=False)
+
+        self.qk_norm = qk_norm
+        # norm over full dim (before head split), same as original
+        self.q_norm = nn.RMSNorm(dim) if qk_norm else nn.Identity()
+        self.k_norm = nn.RMSNorm(dim) if qk_norm else nn.Identity()
+
+        self.proj = nn.Sequential(
+            nn.Linear(dim, dim, bias=proj_bias),
+        )
+
+    def forward(self, x, context, rope=None, mask=None):
+        B, N_q, C = x.shape
+        B, N_kv, _ = context.shape
+
+        q = self.q(x)                                                        # (B, N_q, C)
+        kv = self.kv(context).reshape(B, N_kv, 2, C)
+        k, v = kv.unbind(2)                                                  # each (B, N_kv, C)
+
+        if self.qk_norm:
+            q = self.q_norm(q.to(self.q_norm.weight.dtype))
+            k = self.k_norm(k.to(self.k_norm.weight.dtype))
+
+        # reshape into multi-head format
+        # note the dim ordering: (B, h, d, N) — same convention as original
+        q = rearrange(q, 'b n (h d) -> b h d n', h=self.heads)              # (B, h, d, N_q)
+        k = rearrange(k, 'b n (h d) -> b h d n', h=self.heads)              # (B, h, d, N_kv)
+        v = rearrange(v, 'b n (h d) -> b h d n', h=self.heads)              # (B, h, d, N_kv)
+
+        if rope is not None:
+            q = rope(q)
+            k = rope(k)
+
+        q = F.relu(q, inplace=False)
+        k = F.relu(k, inplace=False)
+
+        eps = torch.finfo(q.dtype).eps
+
+        # normalization: sum over N_kv (the key sequence), then contract with q over N_q
+        # k.sum(dim=-1): (B, h, d) → keepdim → (B, h, d, 1) → transpose → (B, h, 1, d)
+        # @ q (B, h, d, N_q) → (B, h, 1, N_q)
+        z = 1 / (k.sum(dim=-1, keepdim=True).transpose(-2, -1) @ q + eps)   # (B, h, 1, N_q)
+
+        # context aggregation: v (B, h, d, N_kv) @ k^T (B, h, N_kv, d) → (B, h, d, d)
+        context_mat = v @ k.transpose(-2, -1)                                # (B, h, d, d)
+        out = context_mat @ q                                                # (B, h, d, N_q)
+        out = out * z                                                        # (B, h, d, N_q)
+
+        out = rearrange(out, 'b h d n -> b n (h d)')                        # (B, N_q, C)
+        return self.proj(out)
+
 
 def broadcat(tensors, dim = -1):
     num_tensors = len(tensors)
@@ -387,6 +565,122 @@ class WindowAttention(nn.Module):
 
     def extra_repr(self) -> str:
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
+
+
+class AttentionCP(nn.Module):
+    """
+    CP-aware Attention. cp_group is injected by the trainer after init.
+    Pass cp_group=None for single-GPU / no CP (fully backward compatible).
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        attn_drop: float = 0.,
+        proj_drop: float = 0.,
+        proj_bias: bool = True,
+        fused_attn: bool = True,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+ 
+        self.num_heads  = num_heads
+        self.head_dim   = dim // num_heads
+        self.scale      = self.head_dim ** -0.5
+        self.fused_attn = fused_attn
+ 
+        self.qkv       = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qk_norm   = qk_norm
+        self.q_norm    = nn.RMSNorm(self.head_dim)
+        self.k_norm    = nn.RMSNorm(self.head_dim)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj      = nn.Linear(dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+ 
+        # Injected by trainer after building the mesh. None = no CP.
+        self.cp_group: dist.ProcessGroup | None = None
+ 
+    def forward(self, x: torch.Tensor, rope=None) -> torch.Tensor:
+        B, N, C = x.shape
+ 
+        # ── QKV projection ────────────────────────────────────────────────────
+        qkv = (
+            self.qkv(x)
+            .reshape(B, N, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)           # [3, B, heads, N, head_dim]
+        )
+        q, k, v = qkv.unbind(0)               # each [B, heads, N, head_dim]
+        dtype = q.dtype
+ 
+        if self.qk_norm:
+            q = self.q_norm(q.to(self.q_norm.weight.dtype)).to(dtype)
+            k = self.k_norm(k.to(self.k_norm.weight.dtype)).to(dtype)
+ 
+        if rope is not None:
+            q = rope(q)
+            k = rope(k)
+ 
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+ 
+        # ── Context Parallelism: all-gather K and V ───────────────────────────
+        # q stays local (this rank's chunk only).
+        # k, v are gathered from all CP ranks -> full-sequence K/V.
+        #
+        # Memory cost per GPU:
+        #   Q:      [B, heads, seq/cp, head_dim]   <- local only
+        #   K, V:   [B, heads, seq,    head_dim]   <- full (gathered)
+        #
+        # For hidden=256 K/V are small; ring-attn would halve this further
+        # at the cost of a more complex implementation.
+        if self.cp_group is not None and dist.get_world_size(self.cp_group) > 1:
+            cp_size = dist.get_world_size(self.cp_group)
+ 
+            k_chunks = [torch.empty_like(k) for _ in range(cp_size)]
+            v_chunks = [torch.empty_like(v) for _ in range(cp_size)]
+            dist.all_gather(k_chunks, k, group=self.cp_group)
+            dist.all_gather(v_chunks, v, group=self.cp_group)
+ 
+            # Reconstruct full-sequence K/V along the sequence dim (dim=2)
+            k_full = torch.cat(k_chunks, dim=2)   # [B, heads, total_N, head_dim]
+            v_full = torch.cat(v_chunks, dim=2)
+        else:
+            k_full, v_full = k, v
+ 
+        # ── Attention kernel ──────────────────────────────────────────────────
+        if is_flash_attn_available:
+            # FA4 layout: [B, N, heads, head_dim]
+            # Q is local (N = seq/cp), KV are full (N = total_seq).
+            # FA4 supports Q_len != KV_len natively (cross-attention mode).
+            q_fa = q.permute(0, 2, 1, 3).contiguous()        # [B, local_N, heads, head_dim]
+            k_fa = k_full.permute(0, 2, 1, 3).contiguous()   # [B, total_N, heads, head_dim]
+            v_fa = v_full.permute(0, 2, 1, 3).contiguous()
+ 
+            x, *_ = flash_attn_func(q_fa, k_fa, v_fa, causal=False)
+            # FA4 returns [B, local_N, heads, head_dim] -> [B, heads, local_N, head_dim]
+            x = x.permute(0, 2, 1, 3)
+ 
+        elif self.fused_attn:
+            # SDPA: q [B, heads, local_N, head_dim] x kv [B, heads, total_N, head_dim]
+            x = F.scaled_dot_product_attention(
+                q, k_full, v_full,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
+        else:
+            q = q * self.scale
+            attn = q @ k_full.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v_full
+ 
+        # ── Output projection ─────────────────────────────────────────────────
+        x = x.transpose(1, 2).reshape(B, N, C)   # [B, local_N, C]
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
 
 
 def rotate_half(x):

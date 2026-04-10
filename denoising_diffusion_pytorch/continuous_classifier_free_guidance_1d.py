@@ -25,7 +25,7 @@ from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from ema_pytorch import EMA
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from torch.distributed._composable.fsdp import FSDPModule
 
 from tqdm.auto import tqdm
@@ -332,9 +332,9 @@ class Attention(Module):
             q = self.q_norm(q.to(self.q_norm.weight.dtype)).to(dtype)
             k = self.k_norm(k.to(self.k_norm.weight.dtype)).to(dtype)
         # n y c ESTAN AL REVES AQUI, PERO FUNCIONA MEJOR ¿?
-        q, k, v = map(lambda t: rearrange(t, 'b n (h c) -> b h c n', h = self.heads), (q, k, v))
+        q, k, v = map(lambda t: rearrange(t, 'b n (h c) -> b h n c', h = self.heads), (q, k, v))
         out = F.scaled_dot_product_attention(q, k, v) # this outputs (b, h, c, n)
-        out = rearrange(out, 'b h c n -> b (h c) n')
+        out = rearrange(out, 'b h n c -> b (h c) n')
 
         # replace this with flash attention
         # q = q * self.scale
@@ -1390,9 +1390,14 @@ class Trainer1D(object):
                 # for _ in range(self.gradient_accumulate_every):
                 data = next(self.dl)#.to(device)
                 with accelerator.accumulate(self.model):
-                    sequence, classes = data[0].to(device), data[1].to(device)
+                    if len(data) == 2:
+                        sequence, classes = data[0], data[1]
+                        model_inputs = {"classes": classes}
+                    elif len(data) == 4:
+                        sequence, classes, context, mask = data[0], data[1], data[2], data[3]
+                        model_inputs = {"classes": classes, "context": context, "mask": mask}
                     with self.accelerator.autocast():
-                        loss = self.model(sequence, classes=classes)
+                        loss = self.model(sequence, **model_inputs)
                         # loss = loss / self.gradient_accumulate_every
                         # total_loss += loss.item()
 
@@ -1469,7 +1474,7 @@ class Trainer1D(object):
         accelerator.print('training complete')
         # profiler.__exit__(None, None, None)
     
-    def eval_model(self, dataset_test, batch_size=32, **sampling_kwargs):
+    def eval_model(self, dataset_test, batch_size=32, use_autocast=False, **sampling_kwargs):
         # Prepare models
         dl_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=4)
         
@@ -1489,13 +1494,17 @@ class Trainer1D(object):
         
         all_preds = []
         all_seqs = []
-        
         for data in tqdm(test_dataloader, disable=not self.accelerator.is_main_process):
-            sequence, classes = data[0], data[1]
+            if len(data) == 2:
+                sequence, classes = data[0], data[1]
+                model_inputs = {"classes": classes}
+            elif len(data) == 4:
+                sequence, classes, context, mask = data[0], data[1], data[2], data[3]
+                model_inputs = {"classes": classes, "context": context, "mask": mask}
             with torch.inference_mode():    
-                # with self.accelerator.autocast():
-                pred = model.sample(classes=classes, **sampling_kwargs)
-                
+                with (self.accelerator.autocast() if use_autocast else nullcontext()):
+                    pred = model.sample(**model_inputs, **sampling_kwargs)
+
                 # gather_for_metrics works automatically for both single and multi-GPU
                 gathered_pred, sequence = self.accelerator.gather_for_metrics((pred, sequence))
         

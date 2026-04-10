@@ -175,7 +175,7 @@ class Transport:
             # uniform sampling between self.sp_timesteps[0] and self.sp_timesteps[1]
             t = th.rand((x1.shape[0],)) * (sp_timesteps[1] - sp_timesteps[0]) + sp_timesteps[0]
 
-        t = t.to(x1)
+        t = t.to(device=x1.device, dtype=x1.dtype)
         return t, x0, x1
     
     def disp_loss(self, z): # Dispersive Loss implementation (InfoNCE-L2 variant)
@@ -539,7 +539,7 @@ class Sampler:
         )
 
         def _sample_fn(x, model, **model_kwargs):
-            init_logp = th.zeros(x.size(0)).to(x)
+            init_logp = th.zeros(x.size(0)).to(device=x.device, dtype=x.dtype)
             input = (x, init_logp)
             drift, delta_logp = _ode.sample(input, model, **model_kwargs)
             drift, delta_logp = drift[-1], delta_logp[-1]
@@ -583,19 +583,19 @@ class FlowMatching(nn.Module):
         self.channels = neural_net.channels
         self.cond_dim = neural_net.cond_dim
 
-    def forward(self, x, classes=None):
+    def forward(self, x, classes=None, context=None, mask=None):
         terms = self.sampler.transport.training_losses(
             self.neural_net,
             x,
             shifted_mu=self.shifted_mu,
-            model_kwargs={"classes": classes}
+            model_kwargs={"classes": classes, "context": context, "mask": mask}
         )
         loss = terms["loss"].mean()
         if "cos_loss" in terms:
             loss += terms["cos_loss"].mean()
         return loss
 
-    def sample(self, classes, return_all_steps=False, **model_kwargs):
+    def sample(self, classes, context=None, mask=None, return_all_steps=False, **model_kwargs):
         sample_fn = self.sampler.sample_ode(
             sampling_method=self.sampling_method,
             num_steps=self.num_sampling_steps,
@@ -608,6 +608,8 @@ class FlowMatching(nn.Module):
         z = torch.randn(batch_size, self.neural_net.channels, *self.input_size, device=classes.device)
         model_fn = self.neural_net.forward_with_cond_scale
         model_kwargs["classes"] = classes
+        model_kwargs["context"] = context
+        model_kwargs["mask"] = mask
         if "cond_scale" not in model_kwargs:
             model_kwargs["cond_scale"] = self.cond_scale
         samples = sample_fn(z, model_fn, **model_kwargs)
