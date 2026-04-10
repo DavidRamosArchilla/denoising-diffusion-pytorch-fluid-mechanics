@@ -66,6 +66,11 @@ dataset_test = TensorDataset(
     torch.tensor(latents_test, dtype=torch.float32), torch.tensor(X_test, dtype=torch.float32)
 )  
 
+# para mare nostrum
+# depth=14,
+# hidden_size=768,
+# patch_size=1,
+# num_heads=6,
 model = DiT(
     depth=12,
     hidden_size=256,
@@ -77,12 +82,14 @@ model = DiT(
     in_channels=dataset_train.tensors[0].shape[1],
     learn_sigma=False,
     use_swiglu=True,
-    attn_type="vanilla", # linear vanilla triton_linear
+    attn_type="linear", # linear vanilla triton_linear
     qk_norm=True, # to avoid stability issues with bf16
     mlp_ratio=4,
+    use_rope=True
     # num_experts=4,
     # num_experts_per_tok=2
 )
+
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 
 sampler = Sampler(transport=create_transport(
@@ -95,12 +102,12 @@ diffusion = FlowMatching(
     model,
     input_size=dataset_train.tensors[0].shape[2],
     cond_scale=6,
-    num_sampling_steps=500,
+    num_sampling_steps=400,
     sampling_method="euler",
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/onera_ldm/Dit_S_1_MSA'
+results_folder = 'results/onera_ldm/dit_s_linear_trully_rope'
 
 train_steps = 300000
 
@@ -108,11 +115,11 @@ trainer = Trainer1D(
     diffusion,
     dataset=dataset_train,
     # dataset_test=dataset_test,
-    train_batch_size=32,
+    train_batch_size=16,
     train_lr=2e-4,
     num_samples=9,
-    train_num_steps=train_steps+4,  # total training steps
-    gradient_accumulate_every=1,  # gradient accumulation steps
+    train_num_steps=train_steps,  # total training steps
+    gradient_accumulate_every=2,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
     amp = True,                       # turn on mixed precision
     mixed_precision_type='bf16',
@@ -126,11 +133,11 @@ trainer = Trainer1D(
     split_batches=True
 )
 
-trainer.load(2)
+# trainer.load(20)
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 trainer.train()
 
-samples, seqs = trainer.eval_model(dataset_test, batch_size=32)
+samples, seqs = trainer.eval_model(dataset_test, batch_size=32) # , cfg_interval_start=0.2
 
 if trainer.accelerator.is_main_process:
     # actual_size = len(dataset_test)

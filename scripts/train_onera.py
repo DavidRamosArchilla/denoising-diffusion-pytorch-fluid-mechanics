@@ -7,8 +7,9 @@ from torch.utils.data import TensorDataset
 import torch.nn.functional as F
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance_1d import GaussianDiffusion1D, Trainer1D, Unet1D
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance import evaluate_model
-from denoising_diffusion_pytorch.dit import DiT_models, DiT
+from denoising_diffusion_pytorch.dit import DiT_models, DiT, DiTBlock, DiTCoordPE
 from denoising_diffusion_pytorch.transport import create_transport, Sampler, FlowMatching
+from denoising_diffusion_pytorch.trainer_hybrid import TrainerHybrid, TrainerCP
 import shutil
 import os
 import pandas as pd
@@ -32,14 +33,12 @@ df_description = pd.read_csv(data_dir + '/describe_train_test_repartition_with_w
 df_test = df_description.loc[~df_description['Train']]
 df_train = df_description.loc[df_description['Train']]
 
-confidence_weight_test = df_test['confidence_weight_simple'].values
-confidence_weight_test_pointwise = np.repeat(confidence_weight_test, nwallp)
-
-confidence_weight_train_tot = df_train['confidence_weight_simple'].values
-
 ncase = len(df_description)  # 468
 ntest = len(df_test) # 156
 ntrain = ncase-ntest  # 312
+
+# extract xyz coordinates 
+coords = X_train_tot[0:nwallp,:3]
 
 # Remove the geometric informations from the input array
 X_train_tot_conditions = X_train_tot[0::nwallp,6:9]
@@ -50,7 +49,6 @@ Y_test_tot_conditions = np.array([Y_test[nwallp*i:nwallp*(i+1),:] for i in range
 
 print("X_train_tot_conditions shape", X_train_tot_conditions.shape)
 print("Y_train_tot_conditions shape", Y_train_tot_conditions.shape)
-
 # split X_train_tot and Y_train_tot into train and validation arrays
 X_train = X_train_tot_conditions
 X_test = X_test_conditions
@@ -82,9 +80,9 @@ X_test = (X_test - condition_mean) / condition_std
 
 # pad sequences to a multple of a power of 2. 260864 = 256 * 1019
 original_length = Y_train.shape[2]
-pad_length = 260864
-Y_train = F.pad(Y_train, (0, pad_length - nwallp))
-Y_test = F.pad(Y_test, (0, pad_length - nwallp))
+# pad_length = 260864
+# Y_train = F.pad(Y_train, (0, pad_length - nwallp))
+# Y_test = F.pad(Y_test, (0, pad_length - nwallp))
 
 print("X train shape", X_train.shape)
 print("X test shape", X_test.shape)
@@ -106,40 +104,53 @@ dataset_test = TensorDataset(
 #     # flash_attn = False,
 #     channels=dataset_train.tensors[0].shape[1],  
 #     cond_dim=dataset_train.tensors[1].shape[1],
-#     cond_drop_prob=0.5,
+#     cond_drop_prob=0.2,
 #     attn_dim_head=64,
 #     attn_heads=8,
 #     learn_sigma=False,
 #     # self_condition=True,
 #     # full_attn = False
 # )
-# model = DiT_models['DiT-S/1'](
-#     input_size=dataset_train.tensors[0].shape[2],
+# model = DiT(
+#     depth=12,
+#     hidden_size=256,
+#     patch_size=1,
+#     num_heads=8,
+#     input_size=Y_train.shape[2],
 #     cond_dim=dataset_train.tensors[1].shape[1],
-#     class_dropout_prob=0.5,
+#     class_dropout_prob=0.2,
 #     in_channels=dataset_train.tensors[0].shape[1],
 #     learn_sigma=False,
-#     # use_bias=False,
 #     use_swiglu=True,
-#     use_rope=True,
+#     attn_type="linear", # linear vanilla triton_linear
+#     qk_norm=True, # to avoid stability issues with bf16
+#     mlp_ratio=4,
+#     use_rope=True
+#     # num_experts=4,
+#     # num_experts_per_tok=2
 # )
-model = DiT(
-    depth=6,
-    hidden_size=128,
+model = DiTCoordPE(
+    coords=torch.tensor(coords, dtype=torch.float32),
+    depth=12,
+    hidden_size=256,
     patch_size=1,
-    num_heads=4,
+    num_heads=8,
     input_size=Y_train.shape[2],
     cond_dim=dataset_train.tensors[1].shape[1],
-    class_dropout_prob=0.1,
+    class_dropout_prob=0.2,
     in_channels=dataset_train.tensors[0].shape[1],
     learn_sigma=False,
+    # use_bias=False,
     use_swiglu=True,
-    attn_type="linear",
-    qk_norm=True, # to avoid stability issues with bf16
-    mlp_ratio=4,
+    use_rope=True,
+    qk_norm=True,
+    attn_type="linear",  # window, linear, vanilla
+    # window_size=107,
     # num_experts=8,
     # num_experts_per_tok=2
+    mlp_ratio=4,
 )
+
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 
 # diffusion = GaussianDiffusion1D(
@@ -169,58 +180,75 @@ diffusion = FlowMatching(
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/onera/dit_XXS_1_linear_bf16'
+results_folder = 'results/onera/dit_S_1_coord_PE'
 
-train_steps = 105000
+train_steps = 300000
 
 trainer = Trainer1D(
     diffusion,
     dataset=dataset_train,
     # dataset_test=dataset_test,
-    train_batch_size=4,
+    train_batch_size=8,
     train_lr=2e-4,
     num_samples=9,
     train_num_steps=train_steps+4,  # total training steps
-    gradient_accumulate_every=8,  # gradient accumulation steps
+    gradient_accumulate_every=4,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
     amp = True,                       # turn on mixed precision
     mixed_precision_type='bf16',
     results_folder=results_folder,  # folder to save results to
-    save_and_sample_every=15000,
+    save_and_sample_every=20000,
     eta_min_scheduler=1e-6,
     max_grad_norm=1.0,
     # use_cpu=True,
     # use_muon=True,
-    compile_model=True,
+    compile_model=True, 
     split_batches=True
 )
 
-trainer.load(6)
+# trainer = TrainerCP(
+#     diffusion,
+#     dataset=dataset_train,
+#     cp_size=2,
+#     # dataset_test=dataset_test,
+#     train_batch_size=1,
+#     train_lr=2e-4,
+#     num_samples=9,
+#     train_num_steps=train_steps+4,  # total training steps
+#     gradient_accumulate_every=4,  # gradient accumulation steps
+#     ema_decay=0.995,  # exponential moving average decay
+#     amp = True,                       # turn on mixed precision
+#     mixed_precision_type='bf16',
+#     results_folder=results_folder,  # folder to save results to
+#     save_and_sample_every=15000,
+#     eta_min_scheduler=1e-6,
+#     max_grad_norm=1.0,
+#     # use_cpu=True,
+#     # use_muon=True,
+#     # compile_model=True, 
+# )
+# trainer.load(20)
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
-# trainer.train()
+trainer.train()
+
+trainer.ema.ema_model.eval()
+# samples = trainer.ema.ema_model.sample(dataset_test.tensors[1][:1].to(trainer.device), return_all_steps=True)
+samples, seqs = trainer.eval_model(dataset_test, batch_size=16, use_autocast=True)
+# torch.save(samples, f"{results_folder}/samples_to_animation.pt")
 
 if trainer.accelerator.is_main_process:
-    # torch.cuda.empty_cache()  # Clear GPU memory
-    diffusion = trainer.accelerator.unwrap_model(diffusion, keep_torch_compile=True)
-    trainer.ema.ema_model.eval()  # Ensure eval mode
-    diffusion.eval()
-
+    # actual_size = len(dataset_test)
+    print(samples.shape)
+    print("NaNs: ", torch.isnan(samples).sum())
     test_data, test_parameters = dataset_test.tensors
-    errors, samples = evaluate_model(
-        trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion
-        test_parameters,
-        test_data,
-        4,
-        cond_scale=6
-    )
-    print(f"Final errors:\n{errors}")
+
     samples = samples[:, :, :original_length]  # unpad
-    torch.save(samples, f"{results_folder}/sample-6.pt")
+    torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
 
     from cetaceo.evaluators import RegressionEvaluator
     # preds = preds * (cp_max - cp_min) + cp_min
     samples = (samples * train_std) + train_mean
-    test_data = (test_data * train_std) + train_mean
+    test_data = (test_data[:, :, :original_length] * train_std) + train_mean
 
     evaluator = RegressionEvaluator()
     metrics = evaluator(samples, test_data)

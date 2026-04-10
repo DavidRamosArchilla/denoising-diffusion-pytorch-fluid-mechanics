@@ -3,8 +3,8 @@ import torch
 from torch.utils.data import TensorDataset
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance_1d import Unet1D, GaussianDiffusion1D, Trainer1D
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance import evaluate_model
-from denoising_diffusion_pytorch.learned_gaussian_diffusion import LearnedGaussianDiffusion1D
 from denoising_diffusion_pytorch.transport import create_transport, Sampler, FlowMatching
+from denoising_diffusion_pytorch.dit import DiT_models
 
 import shutil
 import os
@@ -24,10 +24,12 @@ if torch.cuda.is_available():
     print(f"Current device name: {torch.cuda.get_device_name()}")
 
 
-data = np.load("data/dlr_airfoils/cp_train_small.npy")
+data = np.load("data/dlr_airfoils/cp_train_1d.npy")
 # at the moment the model expects inputs in [0, 1], like grayscale images 
 data_min, data_max = data.min(), data.max()
-data = (data - data_min) / (data_max - data_min)  # scale to [0, 1]
+data_mean, data_std = data.mean(), data.std()
+# data = (data - data_min) / (data_max - data_min)  # scale to [0, 1]
+data = (data - data_mean) / data_std  # standardize
 # data = data.reshape(data.shape[0], 1, -1)  # concatenate the 2 channels into 1
 print(data.shape)
 # pad the sequences so they are divisible by 4 and i have no problems with the downsampling of the unet
@@ -36,34 +38,50 @@ print(data.shape)
 #              (1, 1))    # Add 1 element before and 1 after the sequence dimension
 # data = np.pad(data, pad_width=pad_width, mode='constant', constant_values=0)
 
-parameters = np.load("data/dlr_airfoils/conditions_train_small.npy")
+parameters = np.load("data/dlr_airfoils/conditions_train_1d.npy")
 parameters_mean, parameters_std = parameters.mean(axis=0), parameters.std(axis=0)
 parameters = (parameters - parameters_mean) / (parameters_std)
 
 # load test data
-test_data = np.load("data/dlr_airfoils/cp_test.npy")
-test_data = (test_data - data_min) / (data_max - data_min) 
+test_data = np.load("data/dlr_airfoils/cp_test_1d.npy")
+# test_data = (test_data - data_min) / (data_max - data_min) 
+test_data = (test_data - data_mean) / data_std
 # test_data = test_data.reshape(test_data.shape[0], 1, -1)
 # test_data = np.pad(test_data, pad_width=pad_width, mode='constant', constant_values=0)
-test_parameters = np.load("data/dlr_airfoils/conditions_test.npy")
+test_parameters = np.load("data/dlr_airfoils/conditions_test_1d.npy")
 test_parameters = (test_parameters - parameters_mean) / (parameters_std)
 
 dataset = TensorDataset(torch.tensor(data, dtype=torch.float32), torch.tensor(parameters, dtype=torch.float32))
 dataset_test = TensorDataset(torch.tensor(test_data, dtype=torch.float32), torch.tensor(test_parameters, dtype=torch.float32))
-model = Unet1D(
-    dim = 64,
-    dim_mults=(1, 2, 4), #, 8),
-    # flash_attn = False,
-    channels=2,
+# model = Unet1D(
+#     dim = 64,
+#     dim_mults=(1, 2, 4), #, 8),
+#     # flash_attn = False,
+#     channels=2,
+#     cond_dim=2,
+#     # attn_heads=8,
+#     # full_attn=True,
+#     # cross_attn=True,
+#     learned_sinusoidal_cond=True,
+#     learn_sigma=False,
+#     # self_condition=True
+# )
+model = DiT_models['DiT-XXS/1'](
+    input_size=dataset.tensors[0].shape[2],
     cond_dim=2,
-    # attn_heads=8,
-    # full_attn=True,
-    # cross_attn=True,
-    learned_sinusoidal_cond=True,
+    class_dropout_prob=0.2,
+    in_channels=1,
     learn_sigma=False,
-    # self_condition=True
+    # use_bias=False,
+    use_swiglu=True,
+    use_rope=False,
+    # qk_norm=True,
+    attn_type="vanilla", # window, linear, vanilla
+    # window_size=107,
+    # num_experts=8,
+    # num_experts_per_tok=2
+    mlp_ratio=2.5
 )
-
 # diffusion = GaussianDiffusion1D(
 #     model,
 #     seq_length=data.shape[-1], # 298 points of the airfoil + 2 padding --> 300 (which is divisible by 4)
@@ -85,7 +103,7 @@ diffusion = FlowMatching(
     sampler,
     model,
     input_size=data.shape[-1],
-    cond_scale=6,
+    cond_scale=2,
     num_sampling_steps=500,
     sampling_method="euler",
 )
@@ -94,7 +112,7 @@ print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 2**30} GB")
 
-results_folder = 'results/dlr/unet_big_FM_euler_500'
+results_folder = 'results/dlr/FM_dit_xxs_1_one_channel'
 # results_folder = 'results/dlr/test'
 
 
@@ -106,12 +124,13 @@ trainer = Trainer1D(
     train_batch_size=8,
     train_lr=1e-4,
     num_samples=9,
-    train_num_steps=100001,  # total training steps
+    train_num_steps=150000,  # total training steps
     gradient_accumulate_every=1,  # gradient accumulation steps
-    ema_decay=0.99,  # exponential moving average decay
+    ema_decay=0.995,  # exponential moving average decay
     # amp = True,                       # turn on mixed precision
     results_folder=results_folder,  # folder to save results to
     save_and_sample_every=10000,
+    eta_min_scheduler=1e-6,
     max_grad_norm=1.0,
     # use_cpu=True,
     # compile_model=True
