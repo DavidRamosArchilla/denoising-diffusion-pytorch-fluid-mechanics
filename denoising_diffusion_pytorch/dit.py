@@ -193,9 +193,9 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=bias)
         )
 
-    def forward(self, x, c, feat_rope=None):
+    def forward(self, x, c, feat_rope=None, mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope, mask=mask)
         x = x.contiguous()
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         
@@ -658,7 +658,7 @@ class DiT(nn.Module):
         x = x.reshape(x.shape[0], c, num_patches * p)  # (B, C, S)
         return x
 
-    def forward(self, x, t, classes, return_act=False, *args, **kwargs):
+    def forward(self, x, t, classes, mask=None, return_act=False, *args, **kwargs):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -672,7 +672,8 @@ class DiT(nn.Module):
         c = t + y                                # (N, D)
         for block in self.blocks:
             # x = checkpoint(block, x, c, self.feat_rope, use_reentrant=False)
-            x = block(x, c, self.feat_rope)                      # (N, T, D)
+            # TODO: añadir mask aqui
+            x = block(x, c, self.feat_rope, mask)                      # (N, T, D)
         act = x
         x = self.final_layer(x, c)               # (B, num_patches, patch_size * out_channels)
         x = self.unpatchify(x)                   # (B, out_channels, S)

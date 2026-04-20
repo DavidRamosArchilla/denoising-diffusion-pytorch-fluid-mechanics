@@ -186,7 +186,7 @@ class Attention(nn.Module):
             k_fa = k.permute(0, 2, 1, 3)
             v_fa = v.permute(0, 2, 1, 3)
             def mask_mod(b, h, q_idx, kv_idx):
-                return mask[b, h, q_idx, kv_idx]
+                return mask[b, kv_idx]
             
             x, *_ = flash_attn_func(
                 q_fa, k_fa, v_fa,
@@ -200,7 +200,7 @@ class Attention(nn.Module):
             x = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.attn_drop.p if self.training else 0.,
-                attn_mask=mask
+                attn_mask=mask[:, None, None, :] if mask is not None else None  # broadcast mask to (B, heads, N_q, N_kv)
             )
             # flash attn expects qkv to have sgape (B, N, heads, head_dim)
             # q, k, v = map(lambda w: w.permute(0, 2, 1, 3), (q, k, v))
@@ -352,14 +352,19 @@ class LinearAttention(nn.Module):
             q = self.q_norm(q.to(self.q_norm.weight.dtype))
             k = self.k_norm(k.to(self.k_norm.weight.dtype)) # (B, N, C)
         
+        # apply rope first, since it assumes that sequence dimenstion (N) is in the position -2
+        if rope is not None:
+            q = rearrange(q, 'b n (h d) -> b h n d', h=self.heads)  # (B, h, d, N_q)
+            k = rearrange(k, 'b n (h d) -> b h n d', h=self.heads)  # (B, h, d, N_kv)
+            q = rope(q)
+            k = rope(k)
+            q = rearrange(q, 'b h n d -> b n (h d)')  # (B, N_q, C)
+            k = rearrange(k, 'b h n d -> b n (h d)', h=self.heads)  # (B, N_kv, C)
+
         # Now reshape into multi-head format
         q = rearrange(q, 'b n (h d) -> b h d n', h=self.heads)  # (B, h, d, N)
         k = rearrange(k, 'b n (h d) -> b h d n', h=self.heads)  # (B, h, d, N)
         v = rearrange(v, 'b n (h d) -> b h d n', h=self.heads)  # (B, h, d, N)
-
-        if rope is not None:
-            q = rope(q)
-            k = rope(k)
 
         # use the relu approach https://export.arxiv.org/pdf/2410.10629
         q = F.relu(q, inplace=False)
@@ -420,15 +425,20 @@ class LinearCrossAttention(nn.Module):
             q = self.q_norm(q.to(self.q_norm.weight.dtype))
             k = self.k_norm(k.to(self.k_norm.weight.dtype))
 
+        # apply rope first, since it assumes that sequence dimenstion (N) is in the position -2
+        if rope is not None:
+            q = rearrange(q, 'b n (h d) -> b h n d', h=self.heads)  # (B, h, d, N_q)
+            k = rearrange(k, 'b n (h d) -> b h n d', h=self.heads)  # (B, h, d, N_kv)
+            q = rope(q)
+            k = rope(k)
+            q = rearrange(q, 'b h n d -> b n (h d)')  # (B, N_q, C)
+            k = rearrange(k, 'b h n d -> b n (h d)', h=self.heads)  # (B, N_kv, C)
+
         # reshape into multi-head format
         # note the dim ordering: (B, h, d, N) — same convention as original
         q = rearrange(q, 'b n (h d) -> b h d n', h=self.heads)              # (B, h, d, N_q)
         k = rearrange(k, 'b n (h d) -> b h d n', h=self.heads)              # (B, h, d, N_kv)
         v = rearrange(v, 'b n (h d) -> b h d n', h=self.heads)              # (B, h, d, N_kv)
-
-        if rope is not None:
-            q = rope(q)
-            k = rope(k)
 
         q = F.relu(q, inplace=False)
         k = F.relu(k, inplace=False)
@@ -732,5 +742,4 @@ class VisionRotaryEmbeddingFast(nn.Module):
         # Reshape to (1, 1, Seq_Len, Dim) for broadcasting
         cos = self.freqs_cos[:seq_len].view(1, 1, seq_len, -1)
         sin = self.freqs_sin[:seq_len].view(1, 1, seq_len, -1)
-        
         return t * cos + rotate_half(t) * sin
