@@ -55,12 +55,15 @@ def sanity_check_splits(split_data):
     print("✅ Sanity check passed: splits are disjoint and complete.")
 
 data_path = "/home/airbus/final_data_airbus/v2/database/clean.h5"
-# split_data = np.load("data/cetaceo/best_train-val-test_split.npy", allow_pickle=True).item()
-split_data = np.load("data/aeronef/best_train-val-test_split.npy", allow_pickle=True).item()
+split_data = np.load("data/cetaceo/best_train-val-test_split.npy", allow_pickle=True).item()
+# split_data = np.load("data/aeronef/best_train-val-test_split.npy", allow_pickle=True).item()
 training_indices = get_split_indices("Train", split_data)
-print(len(training_indices), len(set(training_indices)), training_indices)
+validation_indices = get_split_indices("Validation", split_data)
+test_indices = get_split_indices("Test", split_data)
+print(len(training_indices), len(set(training_indices)))
+print(len(validation_indices), len(set(validation_indices)))
+print(len(test_indices), len(set(test_indices)))
 sanity_check_splits(split_data)
-import sys;sys.exit()
 
 # original_dataset = pyLOM.Dataset.load("/home/d.ramos/cetaceo_plane_data/batch1.h5")
 original_dataset = pyLOM.Dataset.load("/home/airbus/final_data_airbus/v2/database/clean.h5")
@@ -136,7 +139,7 @@ print(data_ex[0].shape, data_ex[1].shape)
 model = DiT(
     depth=12,
     hidden_size=384,
-    patch_size=64,
+    patch_size=16,
     num_heads=6,
     input_size=pad_length,
     cond_dim=2,
@@ -174,7 +177,7 @@ diffusion = FlowMatching(
 
 results_folder = 'results/cetaceo_cp/FM_dit_S_64_FL310'
 
-train_steps = 270000
+train_steps = 300000
 
 trainer = Trainer1D(
     diffusion,
@@ -187,9 +190,10 @@ trainer = Trainer1D(
     train_num_steps=train_steps+4,  # total training steps
     gradient_accumulate_every=1,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
-    # amp = True,                       # turn on mixed precision
+    amp = True,                       # turn on mixed precision
+    mixed_precision_type='bf16',
     results_folder=results_folder,  # folder to save results to
-    save_and_sample_every=15000,
+    save_and_sample_every=20000,
     eta_min_scheduler=1e-6,
     max_grad_norm=1.0,
     # use_cpu=True,

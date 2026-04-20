@@ -10,7 +10,7 @@ import os
 import json
 
 
-data_file = 'data/airfrans/ordered_dataset.pt'
+data_file = 'data/airfrans/processed_data.pt' # ordered_dataset processed_data
 data = torch.load(data_file, weights_only=False)
 pressures, coords, conditions = data["pressures"], data["coords"], data["conditions"]
 
@@ -44,7 +44,7 @@ print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 
 sampler = Sampler(transport=create_transport(
     # use_cosine_loss=True,
-    # use_lognorm=True
+    use_lognorm=True
 ))
 
 diffusion = FlowMatching(
@@ -57,14 +57,14 @@ diffusion = FlowMatching(
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/airfrans/dit_xs_cross_self_attn'
+results_folder = 'results/airfrans/dit_s_coordPE_on_both_cross_self_attn_lognorm_rope'
 train_steps = 300000
 trainer = Trainer1D(
     diffusion,
     dataset=train_dataset,
     dataset_test=val_dataset, # small_val_dataset is to avoid timeout when training on 2 GPUs
     train_batch_size=64,
-    train_lr=2e-4,
+    train_lr=1e-4,
     num_samples=9,
     train_num_steps=train_steps,  # total training steps
     gradient_accumulate_every=1,  # gradient accumulation steps

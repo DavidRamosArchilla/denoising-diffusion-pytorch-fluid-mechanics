@@ -115,11 +115,11 @@ trainer = Trainer1D(
     diffusion,
     dataset=dataset_train,
     # dataset_test=dataset_test,
-    train_batch_size=16,
+    train_batch_size=32,
     train_lr=2e-4,
     num_samples=9,
     train_num_steps=train_steps,  # total training steps
-    gradient_accumulate_every=2,  # gradient accumulation steps
+    gradient_accumulate_every=1,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
     amp = True,                       # turn on mixed precision
     mixed_precision_type='bf16',
