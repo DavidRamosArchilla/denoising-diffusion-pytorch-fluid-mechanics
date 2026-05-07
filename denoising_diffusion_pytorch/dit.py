@@ -13,12 +13,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 from einops import repeat, rearrange, pack, unpack
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Mlp # Attention
-from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention, WindowAttention, CrossAttention, LinearCrossAttention
+from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention, WindowAttention, CrossAttention, LinearCrossAttention, AttentionCP
 from functools import partial
 from .basic_modules import SwiGLUFFN
 # from . import is_triton_module_available
@@ -338,6 +339,7 @@ class FinalLayer1D(nn.Module):
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
+        # x = self.norm_final(x)
         x = self.linear(x)
         return x
 
@@ -601,6 +603,8 @@ class DiT(nn.Module):
                 for _ in range(depth)
             ]
         )
+        # initialize cp group as default
+        self.set_cp_group(None, 0, 1)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -658,6 +662,18 @@ class DiT(nn.Module):
         x = x.reshape(x.shape[0], c, num_patches * p)  # (B, C, S)
         return x
 
+    def get_2d_params(self):
+        """
+        Return parameters suitable for Muon optimizer (2D+ parameters like weight matrices).
+        """
+        return [p for p in self.parameters() if p.dim() >= 2]
+
+    def get_1d_params(self):
+        """
+        Return parameters not suitable for Muon optimizer (1D parameters like biases).
+        """
+        return [p for p in self.parameters() if p.dim() < 2]
+
     def forward(self, x, t, classes, mask=None, return_act=False, *args, **kwargs):
         """
         Forward pass of DiT.
@@ -666,16 +682,19 @@ class DiT(nn.Module):
         y: (N,) tensor of class labels
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        # if self.cp_degree > 1:
+        #     x = self._shard_sequence(x)
         t = self.t_embedder(t)                   # (N, D)
         force_drop_ids = kwargs.get("force_drop_ids", None)
         y = self.y_embedder(classes, self.training, force_drop_ids)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
             # x = checkpoint(block, x, c, self.feat_rope, use_reentrant=False)
-            # TODO: añadir mask aqui
             x = block(x, c, self.feat_rope, mask)                      # (N, T, D)
         act = x
         x = self.final_layer(x, c)               # (B, num_patches, patch_size * out_channels)
+        # if self.cp_degree > 1:
+        #     x = self._gather_sequence(x)             # (B, N, emb_dim)
         x = self.unpatchify(x)                   # (B, out_channels, S)
         if return_act:
             return x, act
@@ -748,6 +767,41 @@ class DiT(nn.Module):
         # interpolated_rescaled_logits = rescaled_logits * rescaled_phi + scaled_logits * (1. - rescaled_phi)
 
         # return interpolated_rescaled_logits, null_logits
+
+    def _shard_sequence(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Shard (B, N, D) along N for this CP rank.
+        Called after the patcher, before transformer blocks.
+        """
+        if self.cp_degree == 1:
+            return x
+        N = x.shape[1]
+        assert N % self.cp_degree == 0, f"Token count {N} not divisible by cp_degree {self.cp_degree}"
+        chunk = N // self.cp_degree
+        return x[:, self.cp_mesh.get_local_rank()  * chunk : (self.cp_mesh.get_local_rank() + 1) * chunk].contiguous()
+
+    def _gather_sequence(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        All-gather (B, N_local, D) across CP ranks → (B, N_full, D).
+        Called after transformer blocks, before the unpatcher.
+        """
+        if self.cp_degree == 1:
+            return x
+        B, N_local, D = x.shape
+        # allocate output buffer for all ranks
+        gathered = [torch.zeros_like(x) for _ in range(self.cp_degree)]
+        dist.all_gather(gathered, x, group=self.cp_group)
+        # reassemble in rank order
+        return torch.cat(gathered, dim=1)   # (B, N_full, D)
+
+    def set_cp_group(self, cp_mesh, cp_rank: int, cp_degree: int):
+      self.cp_mesh   = cp_mesh
+      self.cp_rank   = cp_rank
+      self.cp_degree = cp_degree
+      for module in self.modules():
+          if isinstance(module, AttentionCP):
+              module.cp_mesh = cp_mesh
+
 
 class DiTCoordPE(DiT):
     def __init__(self, coords, *args, **kwargs):
@@ -1000,6 +1054,7 @@ class CoordEmbedder(nn.Module):
         out: (B, N, embed_dim)
         """
         enc = fourier_encode(coords.flatten(0, 1))      # (B*N, C*2F)
+        # print(enc.shape, coords.shape, coords.flatten(0, 1).shape)
         emb = self.mlp(enc)                              # (B*N, embed_dim)
         return emb.view(*coords.shape[:2], -1)           # (B, N, embed_dim)
 
