@@ -11,14 +11,27 @@ from torch.nn.attention import SDPBackend
 import torch.distributed as dist
 # import xformers.ops
 from timm.layers import trunc_normal_
+from torch.distributed.tensor.experimental import context_parallel
+from torch.distributed.tensor.experimental._attention import context_parallel_unshard
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Shard
+# from .ring_attn_fa4 import ring_flash_attn_fa4   
 try: 
-    from flash_attn.cute import flash_attn_func
+    from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
     is_flash_attn_available = True
     print("Flash attention 4 enabled ⚡")
 except:
     is_flash_attn_available = False
     print("Flash attention 4 not found, using torch scaled_dot_product")
 AttentionConfig = namedtuple('AttentionConfig', ['backends'])
+
+# try:
+#     # pip install ring-flash-attn
+#     from ring_flash_attn import ring_flash_attn_func
+#     is_ring_attn_available = True
+# except ImportError as e:
+#     print(e)
+#     is_ring_attn_available = False
 
 # helpers
 
@@ -130,11 +143,7 @@ class Attend(nn.Module):
 
         return out
 
-# Attention with rope and rmsnorm. Borrowed from https://github.dev/hustvl/LightningDiT/blob/main/models/lightningdit.py
 class Attention(nn.Module):
-    """
-    Attention module of LightningDiT.
-    """
     def __init__(
         self,
         dim: int,
@@ -185,15 +194,50 @@ class Attention(nn.Module):
             q_fa = q.permute(0, 2, 1, 3)  # (B, N, heads, head_dim)
             k_fa = k.permute(0, 2, 1, 3)
             v_fa = v.permute(0, 2, 1, 3)
-            def mask_mod(b, h, q_idx, kv_idx):
-                return mask[b, kv_idx]
-            
-            x, *_ = flash_attn_func(
-                q_fa, k_fa, v_fa,
-                # dropout_p=self.attn_drop.p if self.training else 0.,
-                causal=False,
-                mask_mod=mask_mod if mask is not None else None
-            )
+            # if q_fa.dtype not in (torch.float16, torch.bfloat16):
+            #     target_dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else torch.float16
+            #     q_fa = q_fa.to(target_dtype)
+            #     k_fa = k_fa.to(target_dtype)
+            #     v_fa = v_fa.to(target_dtype)
+            # def mask_mod(b, h, q_idx, kv_idx):
+            #     return mask[b, kv_idx]
+            # def mask_mod(b, h, q_idx, kv_idx, seqlen_q, seqlen_k):
+            #     return mask[b, kv_idx]
+                
+            # print(q_fa.dtype, x.dtype)
+            # x, *_ = flash_attn_func(
+            #     q_fa, k_fa, v_fa,
+            #     # dropout_p=self.attn_drop.p if self.training else 0.,
+            #     causal=False,
+            #     mask_mod=mask_mod if mask is not None else None
+            # )
+            if mask is not None:
+                seqlens = mask.sum(dim=-1).int()                          # (B,) actual lengths
+                cu_seqlens = F.pad(seqlens.cumsum(0), (1, 0)).int()       # (B+1,)
+
+                # pack only the valid tokens (remove padding)
+                q_packed = q_fa[mask]   # (total_tokens, heads, head_dim)
+                k_packed = k_fa[mask]
+                v_packed = v_fa[mask]
+
+                x_packed, *_ = flash_attn_varlen_func(
+                    q_packed, k_packed, v_packed,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=mask.shape[1],
+                    max_seqlen_k=mask.shape[1],
+                    # dropout_p=self.attn_drop.p if self.training else 0.,
+                    causal=False,
+                )
+                # unpack back to (B, N, heads, head_dim)
+                x = torch.zeros(B, N, self.num_heads, self.head_dim, device=x_packed.device, dtype=x_packed.dtype)
+                x[mask] = x_packed
+            else:
+                x, *_ = flash_attn_func(
+                    q_fa, k_fa, v_fa,
+                    # dropout_p=self.attn_drop.p if self.training else 0.,
+                    causal=False,
+                )
             # FA4 returns (B, N, heads, head_dim) → back to (B, heads, N, head_dim)
             x = x.permute(0, 2, 1, 3)
         elif self.fused_attn:
@@ -291,15 +335,43 @@ class CrossAttention(nn.Module):
             k_fa = k.permute(0, 2, 1, 3)  # (B, N_kv, heads, head_dim)
             v_fa = v.permute(0, 2, 1, 3)
 
-            def mask_mod(b, h, q_idx, kv_idx):
-                return mask[b, kv_idx]
+            # def mask_mod(b, h, q_idx, kv_idx):
+            #     return mask[b, kv_idx]
 
-            x, *_ = flash_attn_func(
-                q_fa, k_fa, v_fa,
-                # dropout_p=self.attn_drop.p if self.training else 0.,
-                causal=False,  # causal makes no sense for cross-attention
-                mask_mod=mask_mod if mask is not None else None,
-            )
+            # x, *_ = flash_attn_func(
+            #     q_fa, k_fa, v_fa,
+            #     # dropout_p=self.attn_drop.p if self.training else 0.,
+            #     causal=False,  # causal makes no sense for cross-attention
+            #     mask_mod=mask_mod if mask is not None else None,
+            # )
+
+            if mask is not None:
+                seqlens = mask.sum(dim=-1).int()                          # (B,) actual lengths
+                cu_seqlens = F.pad(seqlens.cumsum(0), (1, 0)).int()       # (B+1,)
+
+                # pack only the valid tokens (remove padding)
+                q_packed = q_fa[mask]   # (total_tokens, heads, head_dim)
+                k_packed = k_fa[mask]
+                v_packed = v_fa[mask]
+
+                x_packed, *_ = flash_attn_varlen_func(
+                    q_packed, k_packed, v_packed,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=mask.shape[1],
+                    max_seqlen_k=mask.shape[1],
+                    # dropout_p=self.attn_drop.p if self.training else 0.,
+                    causal=False,
+                )
+                # unpack back to (B, N, heads, head_dim)
+                x = torch.zeros(B, N_q, self.num_heads, self.head_dim, device=x_packed.device, dtype=x_packed.dtype)
+                x[mask] = x_packed
+            else:
+                x, *_ = flash_attn_func(
+                    q_fa, k_fa, v_fa,
+                    # dropout_p=self.attn_drop.p if self.training else 0.,
+                    causal=False,
+                )
             x = x.permute(0, 2, 1, 3)  # (B, heads, N_q, head_dim)
 
         elif self.fused_attn:
@@ -576,12 +648,7 @@ class WindowAttention(nn.Module):
     def extra_repr(self) -> str:
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
 
-
 class AttentionCP(nn.Module):
-    """
-    CP-aware Attention. cp_group is injected by the trainer after init.
-    Pass cp_group=None for single-GPU / no CP (fully backward compatible).
-    """
     def __init__(
         self,
         dim: int,
@@ -594,8 +661,7 @@ class AttentionCP(nn.Module):
         fused_attn: bool = True,
     ) -> None:
         super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
- 
+        assert dim % num_heads == 0
         self.num_heads  = num_heads
         self.head_dim   = dim // num_heads
         self.scale      = self.head_dim ** -0.5
@@ -609,19 +675,17 @@ class AttentionCP(nn.Module):
         self.proj      = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
  
-        # Injected by trainer after building the mesh. None = no CP.
+        # set by model.set_cp_group(); None means no CP
         self.cp_group: dist.ProcessGroup | None = None
  
-    def forward(self, x: torch.Tensor, rope=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope=None, mask=None) -> torch.Tensor:
         B, N, C = x.shape
- 
-        # ── QKV projection ────────────────────────────────────────────────────
         qkv = (
             self.qkv(x)
             .reshape(B, N, 3, self.num_heads, self.head_dim)
-            .permute(2, 0, 3, 1, 4)           # [3, B, heads, N, head_dim]
+            .permute(2, 0, 3, 1, 4)        # (3, B, heads, N, head_dim)
         )
-        q, k, v = qkv.unbind(0)               # each [B, heads, N, head_dim]
+        q, k, v = qkv.unbind(0)            # each: (B, heads, N, head_dim)
         dtype = q.dtype
  
         if self.qk_norm:
@@ -636,62 +700,91 @@ class AttentionCP(nn.Module):
         k = k.contiguous()
         v = v.contiguous()
  
-        # ── Context Parallelism: all-gather K and V ───────────────────────────
-        # q stays local (this rank's chunk only).
-        # k, v are gathered from all CP ranks -> full-sequence K/V.
-        #
-        # Memory cost per GPU:
-        #   Q:      [B, heads, seq/cp, head_dim]   <- local only
-        #   K, V:   [B, heads, seq,    head_dim]   <- full (gathered)
-        #
-        # For hidden=256 K/V are small; ring-attn would halve this further
-        # at the cost of a more complex implementation.
-        if self.cp_group is not None and dist.get_world_size(self.cp_group) > 1:
-            cp_size = dist.get_world_size(self.cp_group)
+        # FA4 expects (B, N, heads, head_dim)
+        q_fa = q.permute(0, 2, 1, 3)
+        k_fa = k.permute(0, 2, 1, 3)
+        v_fa = v.permute(0, 2, 1, 3)
  
-            k_chunks = [torch.empty_like(k) for _ in range(cp_size)]
-            v_chunks = [torch.empty_like(v) for _ in range(cp_size)]
-            dist.all_gather(k_chunks, k, group=self.cp_group)
-            dist.all_gather(v_chunks, v, group=self.cp_group)
- 
-            # Reconstruct full-sequence K/V along the sequence dim (dim=2)
-            k_full = torch.cat(k_chunks, dim=2)   # [B, heads, total_N, head_dim]
-            v_full = torch.cat(v_chunks, dim=2)
-        else:
-            k_full, v_full = k, v
- 
-        # ── Attention kernel ──────────────────────────────────────────────────
-        if is_flash_attn_available:
-            # FA4 layout: [B, N, heads, head_dim]
-            # Q is local (N = seq/cp), KV are full (N = total_seq).
-            # FA4 supports Q_len != KV_len natively (cross-attention mode).
-            q_fa = q.permute(0, 2, 1, 3).contiguous()        # [B, local_N, heads, head_dim]
-            k_fa = k_full.permute(0, 2, 1, 3).contiguous()   # [B, total_N, heads, head_dim]
-            v_fa = v_full.permute(0, 2, 1, 3).contiguous()
- 
-            x, *_ = flash_attn_func(q_fa, k_fa, v_fa, causal=False)
-            # FA4 returns [B, local_N, heads, head_dim] -> [B, heads, local_N, head_dim]
-            x = x.permute(0, 2, 1, 3)
- 
-        elif self.fused_attn:
-            # SDPA: q [B, heads, local_N, head_dim] x kv [B, heads, total_N, head_dim]
-            x = F.scaled_dot_product_attention(
-                q, k_full, v_full,
-                dropout_p=self.attn_drop.p if self.training else 0.,
+        if q_fa.dtype not in (torch.float16, torch.bfloat16):
+            target = (
+                torch.get_autocast_gpu_dtype()
+                if torch.is_autocast_enabled()
+                else torch.bfloat16
             )
-        else:
-            q = q * self.scale
-            attn = q @ k_full.transpose(-2, -1)
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = attn @ v_full
+            q_fa, k_fa, v_fa = q_fa.to(target), k_fa.to(target), v_fa.to(target)
  
-        # ── Output projection ─────────────────────────────────────────────────
-        x = x.transpose(1, 2).reshape(B, N, C)   # [B, local_N, C]
+        # ── Path 1: Ring Attention (CP active) ───────────────────────────────
+        # if self.cp_group is not None:
+        #     x = ring_flash_attn_fa4(
+        #         q_fa, k_fa, v_fa,
+        #         group=self.cp_group,
+        #         dropout_p=self.attn_drop.p if self.training else 0.,
+        #         causal=False,
+        #     )
+        if self.cp_mesh is not None:
+            assert mask is None, (
+                "Variable-length masking with CP is not supported. "
+                "Pack your sequences to a fixed length before the model."
+            )
+            q_fa = q_fa.permute(0, 2, 1, 3)
+            k_fa = k_fa.permute(0, 2, 1, 3)
+            v_fa = v_fa.permute(0, 2, 1, 3)
+            # context_parallel() expects (B, heads, N_local, head_dim) — SDPA format
+            # We explicitly define the sequence dimension (dim 2) as the sharded dimension
+            placements = [Shard(2)]
+            
+            # Safely wrap intermediate autograd tensors into DTensors
+            q_dt = DTensor.from_local(q, self.cp_mesh, placements, run_check=False)
+            k_dt = DTensor.from_local(k, self.cp_mesh, placements, run_check=False)
+            v_dt = DTensor.from_local(v, self.cp_mesh, placements, run_check=False)
+
+            # Drop the `with context_parallel(...):` manager entirely. 
+            # SDPA automatically dispatches to Context Parallelism when it receives DTensors.
+            cp_out = F.scaled_dot_product_attention(
+                q_dt, k_dt, v_dt,
+                is_causal=False,
+            )
+                
+            # cp_out is a DTensor. Extract the local chunk to continue your local graph
+            x = cp_out.to_local()
+            x = x.permute(0, 2, 1, 3)  # back to (B, N_local, heads, head_dim)
+ 
+        # ── Path 2: Standard FA4, variable length ────────────────────────────
+        elif mask is not None:
+            seqlens    = mask.sum(dim=-1).int()
+            cu_seqlens = F.pad(seqlens.cumsum(0), (1, 0)).int()
+            q_p = q_fa[mask]; k_p = k_fa[mask]; v_p = v_fa[mask]
+            x_p, *_ = flash_attn_varlen_func(
+                q_p, k_p, v_p,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=mask.shape[1], max_seqlen_k=mask.shape[1],
+                dropout_p=self.attn_drop.p if self.training else 0.,
+                causal=False,
+            )
+            x = torch.zeros(B, N, self.num_heads, self.head_dim,
+                            device=x_p.device, dtype=x_p.dtype)
+            x[mask] = x_p
+ 
+        # ── Path 3: Standard FA4, fixed length ───────────────────────────────
+        else:
+            # x, *_ = flash_attn_func(
+            #     q_fa, k_fa, v_fa,
+            #     causal=False,
+            # )
+            q_fa = q_fa.permute(0, 2, 1, 3)
+            k_fa = k_fa.permute(0, 2, 1, 3)
+            v_fa = v_fa.permute(0, 2, 1, 3)
+            F.scaled_dot_product_attention(
+                q_fa, k_fa, v_fa,
+                is_causal=False,
+            )
+ 
+        # x: (B, N, heads, head_dim) → (B, N, C)
+        x = x.reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-
+ 
 
 def rotate_half(x):
     x = rearrange(x, '... (d r) -> ... d r', r = 2)
