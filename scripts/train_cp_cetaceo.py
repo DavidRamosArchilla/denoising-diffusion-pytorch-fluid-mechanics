@@ -8,6 +8,7 @@ from denoising_diffusion_pytorch.dit import DiT_models, DiT
 from denoising_diffusion_pytorch.transport import create_transport, Sampler, FlowMatching
 import shutil
 import os
+import json
 import numpy as np
 
 
@@ -30,17 +31,28 @@ torch.backends.cuda.matmul.allow_tf32 = True
 #         idx = np.where(all_conditions == data[i])[0][0]
 #         indices.append(idx)
 #     return indices
-def get_split_indices(split_name, split_data):
-    all_conditions = split_data["All"]
+def get_split_indices(split_name, split_data, all_conds, atol=1e-4, rtol=1e-12):
     data = split_data[split_name]
+    indices = []
 
-    lookup = {tuple(row): i for i, row in enumerate(all_conditions)}
-    return [lookup[tuple(row)] for row in data]
+    for row in data:
+        # Compare this row against all rows in all_conds
+        matches = np.all(np.isclose(all_conds, row, atol=atol, rtol=rtol), axis=1)
+        found = np.where(matches)[0]
 
-def sanity_check_splits(split_data):
-    train_idx = set(get_split_indices("Train", split_data))
-    val_idx   = set(get_split_indices("Validation", split_data))
-    test_idx  = set(get_split_indices("Test", split_data))
+        if len(found) == 0:
+            raise KeyError(f"No match found within tolerance for {row}")
+        if len(found) > 1:
+            raise ValueError(f"Multiple matches found within tolerance for {row}")
+
+        indices.append(found[0])
+
+    return indices
+
+def sanity_check_splits(split_data, all_conds):
+    train_idx = set(get_split_indices("train", split_data, all_conds))
+    val_idx   = set(get_split_indices("validation", split_data, all_conds))
+    test_idx  = set(get_split_indices("test", split_data, all_conds))
 
     # Check pairwise disjointness
     assert train_idx.isdisjoint(val_idx),  "Train and Validation overlap!"
@@ -49,26 +61,18 @@ def sanity_check_splits(split_data):
 
     # Optional: check coverage
     all_idx = train_idx | val_idx | test_idx
-    assert len(all_idx) == len(split_data["All"]), \
+    assert len(all_idx) == len(split_data["all"]), \
         "Splits do not cover all samples exactly once"
 
     print("✅ Sanity check passed: splits are disjoint and complete.")
 
 data_path = "/home/airbus/final_data_airbus/v2/database/clean.h5"
-split_data = np.load("data/cetaceo/best_train-val-test_split.npy", allow_pickle=True).item()
-# split_data = np.load("data/aeronef/best_train-val-test_split.npy", allow_pickle=True).item()
-training_indices = get_split_indices("Train", split_data)
-validation_indices = get_split_indices("Validation", split_data)
-test_indices = get_split_indices("Test", split_data)
-print(len(training_indices), len(set(training_indices)))
-print(len(validation_indices), len(set(validation_indices)))
-print(len(test_indices), len(set(test_indices)))
-sanity_check_splits(split_data)
 
 # original_dataset = pyLOM.Dataset.load("/home/d.ramos/cetaceo_plane_data/batch1.h5")
 original_dataset = pyLOM.Dataset.load("/home/airbus/final_data_airbus/v2/database/clean.h5")
 original_cp = original_dataset["CoefPressure"]  # shape (num_samples, num_points)
 print("Original Cp shape:", original_cp.shape)
+# la zona del htp es la 2, la del ala es la 8, la 1 es la del fuselaje
 htp_cp = original_cp[original_dataset['Zone'][:, -1] == 2]
 print("HTP Cp shape:", htp_cp.shape)
 # print(np.hstack((original_dataset.xyz, original_dataset['Zone'])).shape)
@@ -77,20 +81,20 @@ print(len(original_dataset.get_variable("aoa")))
 
 # import code; code.interact(local=locals())
 
-def load_dataset(path, norm_coefficients, FL=None, pad_to=None):
-    data = pyLOM.Dataset.load(path)
-    aoa = data.get_variable('aoa')
-    mach = data.get_variable('M')
-    # filter htp zone
+def load_dataset(data, indices, norm_coefficients, FL=None, pad_to=None):
+    aoa = data.get_variable('aoa')[indices]
+    mach = data.get_variable('M')[indices]
+    # filter htp zone -- el htp es la zona 2, el ala es la 8
     cp = data["CoefPressure"][data['Zone'][:, -1] == 2].T
-    if "cp_min" not in norm_coefficients:
-        norm_coefficients["cp_min"] = cp.min()
-        norm_coefficients["cp_max"] = cp.max()
-    cp = (cp - norm_coefficients["cp_min"]) / (norm_coefficients["cp_max"] - norm_coefficients["cp_min"])
-    # if "cp_mean" not in norm_coefficients:
-    #     norm_coefficients["cp_mean"] = cp.mean()
-    #     norm_coefficients["cp_std"] = cp.std()
-    # cp = (cp - norm_coefficients["cp_mean"]) / norm_coefficients["cp_std"]
+    cp = cp[indices]
+    # if "cp_min" not in norm_coefficients:
+    #     norm_coefficients["cp_min"] = cp.min()
+    #     norm_coefficients["cp_max"] = cp.max()
+    # cp = (cp - norm_coefficients["cp_min"]) / (norm_coefficients["cp_max"] - norm_coefficients["cp_min"])
+    if "cp_mean" not in norm_coefficients:
+        norm_coefficients["cp_mean"] = cp.mean()
+        norm_coefficients["cp_std"] = cp.std()
+    cp = (cp - norm_coefficients["cp_mean"]) / norm_coefficients["cp_std"]
 
     if "mach_mean" not in norm_coefficients:
         norm_coefficients["mach_mean"] = mach.mean()
@@ -107,9 +111,9 @@ def load_dataset(path, norm_coefficients, FL=None, pad_to=None):
 
     if FL is not None:
         fl_mask = np.array(data.get_variable('FL')) == FL
+        cp = cp[fl_mask]
         aoa = aoa[fl_mask]
         mach = mach[fl_mask]
-        cp = cp[fl_mask]
 
     cp_t = torch.from_numpy(cp).float().unsqueeze(1)  # add channel dimension
     # cp_t = cp_t[..., :-1]
@@ -124,14 +128,49 @@ def load_dataset(path, norm_coefficients, FL=None, pad_to=None):
     return TensorDataset(cp_t, conditions)
 
 norm_coefficients = {}
+original_length = htp_cp.shape[0]
 # 217088 is the closest multiple of 256 (patch size) greater than 217003 (mesh points)
-pad_length = 217088
-clean_dataset = load_dataset(data_path, norm_coefficients, pad_to=pad_length, FL=310)
-batch1_dataset = load_dataset("/home/d.ramos/cetaceo_plane_data/batch1.h5", norm_coefficients, pad_to=pad_length)
-dataset = torch.utils.data.ConcatDataset([clean_dataset, batch1_dataset])
-train_size = int(0.8 * len(dataset))
-test_size = len(dataset) - train_size
-dataset_train, dataset_test = random_split(dataset, [train_size, test_size])
+pad_length = 217088 # 217088 para el htp | 988672 divisible por 64 | 213344 para el fuselaje, divisible por 16
+clean_data = pyLOM.Dataset.load(data_path)
+fl_mask = np.array(clean_data.get_variable('FL')) == 310
+clean_aoa = clean_data.get_variable('aoa')[fl_mask]
+clean_mach = clean_data.get_variable('M')[fl_mask]
+print(clean_aoa)
+all_conds = torch.from_numpy(np.stack([clean_aoa, clean_mach], axis=1))
+
+print(f"Condition shape: {all_conds.shape}")
+# split_data = np.load("/home/f.gutierrez/CETACEO_UPM/use_cases/aerodynamics/point-wise_mlp/TestCaseBSC/CaseWing/results_TFM/splits/best_train-val-test_split.npy", allow_pickle=True).item()
+with open("/home/airbus/CETACEO_cp_interp/HTP_case/condition_split.json") as f:
+    split_data = json.load(f)
+training_indices = get_split_indices("train", split_data, all_conds.numpy())
+validation_indices = get_split_indices("validation", split_data, all_conds.numpy())
+test_indices = get_split_indices("test", split_data, all_conds.numpy())
+print(len(training_indices), len(set(training_indices)))
+print(len(validation_indices), len(set(validation_indices)))
+print(len(test_indices), len(set(test_indices)))
+sanity_check_splits(split_data, all_conds.numpy())
+
+# create a plot to visualize the distribution of conditions in each split
+import matplotlib.pyplot as plt
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.scatter(all_conds[training_indices, 0], all_conds[training_indices, 1], label='Train', alpha=0.5)
+plt.scatter(all_conds[validation_indices, 0], all_conds[validation_indices, 1], label='Validation', alpha=0.5)
+plt.scatter(all_conds[test_indices, 0], all_conds[test_indices, 1], label='Test', alpha=0.5)
+plt.xlabel('Normalized AoA')
+plt.ylabel('Normalized Mach')
+plt.title('Condition Distribution by Split')
+# move the legend outside the plot
+plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+plt.savefig("condition_distribution.png")
+
+# train_size = int(0.8 * len(dataset))
+# test_size = len(dataset) - train_size
+# dataset_train, dataset_test = random_split(dataset, [train_size, test_size])
+
+dataset_train = load_dataset(clean_data, training_indices, norm_coefficients, pad_to=pad_length)
+dataset_val = load_dataset(clean_data, validation_indices, norm_coefficients, pad_to=pad_length)
+dataset_test = load_dataset(clean_data, test_indices, norm_coefficients, pad_to=pad_length)
 
 data_ex = dataset_train[0]
 print(len(dataset_train), len(dataset_test))
@@ -175,13 +214,12 @@ diffusion = FlowMatching(
     sampling_method="euler",
 )
 
-results_folder = 'results/cetaceo_cp/FM_dit_S_64_FL310'
+results_folder = 'results/cetaceo_cp/FM_dit_S_16_htp'
 
 train_steps = 300000
 
 trainer = Trainer1D(
     diffusion,
-    # 'path/to/your/images',
     dataset=dataset_train,
     dataset_test=dataset_test,
     train_batch_size=8,
@@ -198,20 +236,29 @@ trainer = Trainer1D(
     max_grad_norm=1.0,
     # use_cpu=True,
     # use_muon=True,
-    compile_model=True
+    compile_model=True,
+    split_batches=True
 )
 
-# trainer.load(10)
+# trainer.load(5)
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 trainer.train()
 
-test_data, test_parameters = dataset_test[:]
-errors, samples = evaluate_model(
-    trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion
-    test_parameters,
-    test_data,
-    64,
-    cond_scale=6
-)
-print(f"Final errors:\n{errors}")
-torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
+if trainer.accelerator.is_main_process:
+    test_data, test_parameters = dataset_test[:]
+    errors, samples = evaluate_model(
+        trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion
+        test_parameters,
+        test_data,
+        16,
+        cond_scale=6
+    )
+    print(f"Final errors:\n{errors}")
+    torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
+    samples = (samples * dataset_train.p_std) + dataset_train.p_mean
+    test_data = (test_data * dataset_train.p_std) + dataset_train.p_mean
+    from cetaceo.evaluators import RegressionEvaluator
+    evaluator = RegressionEvaluator()
+    metrics = evaluator(samples, test_data[:, :original_length])
+    # metrics = evaluator(preds, cp_test) # cp_test
+    evaluator.print_metrics()

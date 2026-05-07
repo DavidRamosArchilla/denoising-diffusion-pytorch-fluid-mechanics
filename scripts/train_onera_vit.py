@@ -8,11 +8,13 @@ import torch.nn.functional as F
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance_1d import GaussianDiffusion1D, Trainer1D, Unet1D
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance import evaluate_model
 from denoising_diffusion_pytorch.dit import DiT_models, DiT, DiTBlock, DiTCoordPE
+from denoising_diffusion_pytorch.vit import ViT
 from denoising_diffusion_pytorch.transport import create_transport, Sampler, FlowMatching
 from denoising_diffusion_pytorch.trainer_hybrid import TrainerHybrid, TrainerCP
 import shutil
 import os
 import pandas as pd
+from functools import partial
 
 torch.manual_seed(42)
 if torch.cuda.is_available():
@@ -39,7 +41,7 @@ ntrain = ncase-ntest  # 312
 
 # extract xyz coordinates 
 coords = X_train_tot[0:nwallp,:3]
-
+print(coords.shape)
 # Remove the geometric informations from the input array
 X_train_tot_conditions = X_train_tot[0::nwallp,6:9]
 X_test_conditions = X_test[0::nwallp,6:9]
@@ -98,102 +100,85 @@ dataset_test = TensorDataset(
     Y_test, torch.tensor(X_test, dtype=torch.float32)
 )
 
-# model = Unet1D(
-#     dim=128,
-#     dim_mults=(1, 2, 2, 4),  # , 8),
-#     # flash_attn = False,
-#     channels=dataset_train.tensors[0].shape[1],  
-#     cond_dim=dataset_train.tensors[1].shape[1],
-#     cond_drop_prob=0.2,
-#     attn_dim_head=64,
-#     attn_heads=8,
-#     learn_sigma=False,
-#     # self_condition=True,
-#     # full_attn = False
-# )
-model = DiT(
-    depth=12,
-    hidden_size=256,
-    patch_size=32,
-    num_heads=8,
-    input_size=Y_train.shape[2],
-    cond_dim=dataset_train.tensors[1].shape[1],
-    class_dropout_prob=0.2,
-    in_channels=dataset_train.tensors[0].shape[1],
+
+def mesh_subsample_collate_fn(batch, num_points, coords):
+    """
+    Randomly samples n points from each mesh in the batch.
+    Since all samples have the same size, no padding or mask is needed.
+
+    Args:
+        n : number of points to sample from each mesh
+
+    Returns
+    -------
+    pressure : (B, n) or (B, n, 3)
+    coords   : (B, n, 3)
+    """
+    pressures, conditions = zip(*batch)
+    coords = coords.unsqueeze(0).repeat(len(pressures), 1, 1)  # (B, N, 3)
+    conditions = torch.stack(conditions)
+    def sample(tensors, traspose_channels=False):
+        out = []
+        for t in tensors:
+            if traspose_channels:
+                t = t.permute(1, 0)  # (C, N) -> (N, C)
+            N = t.shape[0]
+            idx = torch.randperm(N)[:num_points]
+            out.append(t[idx])
+        
+        out = torch.stack(out)
+        if traspose_channels:
+            out = out.permute(0, 2, 1)  # (B, n, C) -> (B, C, n)
+        return out
+    
+    pressures = sample(pressures, traspose_channels=True) # .unsqueeze(1)
+    coords = sample(coords).permute(0, 2, 1)  
+    # print(pressures.shape, coords.shape, conditions.shape)
+    # None is returned indicating mask is None to keep consistency with the other collate_fn
+    return pressures, conditions, coords, None
+
+num_subsampling_points = 15000
+
+model = ViT(
+    use_coord_pe=True,
+    coord_dim=3, # xyz
+    depth=6,
+    hidden_size=128,
+    patch_size=1,
+    num_heads=4,
+    input_size=num_subsampling_points, # seq_length, not important for vit
+    cond_dim=3, # mach, aoa, p_i
+    class_dropout_prob=0,
+    in_channels=3, # x, y, z
+    out_channels=4, # cp, cfx, cfy, cfz
     learn_sigma=False,
+    # use_bias=False,
     use_swiglu=True,
-    attn_type="vanilla", # linear vanilla triton_linear
-    qk_norm=True, # to avoid stability issues with bf16
-    mlp_ratio=4,
-    use_rope=True
-    # num_experts=4,
+    # use_rope=True,
+    qk_norm=True,
+    attn_type="vanilla",  # window, linear, vanilla
+    # window_size=107,
+    # num_experts=8,
     # num_experts_per_tok=2
+    mlp_ratio=2.5,
 )
-# model = DiTCoordPE(
-#     coords=torch.tensor(coords, dtype=torch.float32),
-#     depth=12,
-#     hidden_size=256,
-#     patch_size=8,
-#     num_heads=8,
-#     input_size=Y_train.shape[2],
-#     cond_dim=dataset_train.tensors[1].shape[1],
-#     class_dropout_prob=0.2,
-#     in_channels=dataset_train.tensors[0].shape[1],
-#     learn_sigma=False,
-#     # use_bias=False,
-#     use_swiglu=True,
-#     use_rope=True,
-#     qk_norm=True,
-#     attn_type="linear",  # window, linear, vanilla
-#     # window_size=107,
-#     # num_experts=8,
-#     # num_experts_per_tok=2
-#     mlp_ratio=4,
-# )
 
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print("Number of learneable parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
-# diffusion = GaussianDiffusion1D(
-#     model,
-#     seq_length=dataset.tensors[0].shape[2],
-#     objective="pred_noise",  # 'pred_noise' or 'pred_x0'
-#     beta_schedule="cosine",
-#     sampling_timesteps=1000,
-#     timesteps=1000,  # number of steps
-#     # use_cfg_plus_plus=True,
-#     min_snr_loss_weight=True,
-#     min_snr_gamma=5
-# )
+results_folder = 'results/onera/vit_first'
 
-sampler = Sampler(transport=create_transport(
-    # use_cosine_loss=True,
-    # use_lognorm=True
-))
-
-diffusion = FlowMatching(
-    sampler,
-    model,
-    input_size=dataset_train.tensors[0].shape[2],
-    cond_scale=6,
-    num_sampling_steps=500,
-    sampling_method="euler",
-    # shifted_mu=1.0986
-)
-
-results_folder = 'results/onera/dit_S_32_cp_test'
-
-train_steps = 300000
+train_steps = 500000
 
 trainer = Trainer1D(
-    diffusion,
+    model,
     dataset=dataset_train,
     # dataset_test=dataset_test,
-    train_batch_size=8,
+    train_batch_size=32,
     train_lr=2e-4,
     num_samples=9,
     train_num_steps=train_steps+4,  # total training steps
-    gradient_accumulate_every=4,  # gradient accumulation steps
+    gradient_accumulate_every=1,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
     amp = True,                       # turn on mixed precision
     mixed_precision_type='bf16',
@@ -204,28 +189,10 @@ trainer = Trainer1D(
     # use_cpu=True,
     # use_muon=True,
     compile_model=True, 
-    split_batches=True
+    split_batches=True,
+    dataloader_collate_fn=partial(mesh_subsample_collate_fn, num_points=num_subsampling_points, coords=torch.from_numpy(coords))
 )
 
-# trainer = TrainerCP(
-#     diffusion,
-#     dataset=dataset_train,
-#     cp_degree=2,
-#     # dataset_test=dataset_test,
-#     train_batch_size=4,
-#     train_lr=2e-4,
-#     train_num_steps=train_steps+4,  # total training steps
-#     gradient_accumulate_every=4,  # gradient accumulation steps
-#     ema_decay=0.995,  # exponential moving average decay
-#     mixed_precision_type='bf16',
-#     results_folder=results_folder,  # folder to save results to
-#     save_and_sample_every=15000,
-#     eta_min_scheduler=1e-6,
-#     max_grad_norm=1.0,
-#     # use_cpu=True,
-#     # use_muon=True,
-#     # compile_model=True, 
-# )
 # trainer.load(20)
 trainer.train()
 # shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))

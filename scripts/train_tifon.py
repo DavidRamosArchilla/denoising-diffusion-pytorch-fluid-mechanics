@@ -1,5 +1,5 @@
 import os 
-import copy
+import json
 from pathlib import Path
 import shutil
 
@@ -43,9 +43,9 @@ def get_split_indices(split_name, split_data, all_conds, atol=1e-4, rtol=1e-12):
     return indices
 
 def sanity_check_splits(split_data, all_conds):
-    train_idx = set(get_split_indices("Train", split_data, all_conds=all_conds))
-    val_idx   = set(get_split_indices("Validation", split_data, all_conds=all_conds))
-    test_idx  = set(get_split_indices("Test", split_data, all_conds=all_conds))
+    train_idx = set(get_split_indices("train", split_data, all_conds=all_conds))
+    val_idx   = set(get_split_indices("validation", split_data, all_conds=all_conds))
+    test_idx  = set(get_split_indices("test", split_data, all_conds=all_conds))
 
     # Check pairwise disjointness
     assert train_idx.isdisjoint(val_idx),  "Train and Validation overlap!"
@@ -54,7 +54,7 @@ def sanity_check_splits(split_data, all_conds):
 
     # Optional: check coverage
     all_idx = train_idx | val_idx | test_idx
-    assert len(all_idx) == len(split_data["All"]), \
+    assert len(all_idx) == len(split_data["all"]), \
         "Splits do not cover all samples exactly once"
 
     print("✅ Sanity check passed: splits are disjoint and complete.")
@@ -65,17 +65,20 @@ GENERATOR = torch.Generator().manual_seed(SEED)
 DEVICE = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
 DATA_DIR  = Path("/home/airbus/CETACEO_cp_interp/DATA/TIFON")
 
-data = pyLOM.Dataset.load(DATA_DIR / "CADGroup_3_stage_0_reordered.h5")
+data = pyLOM.Dataset.load(DATA_DIR / "CADGroup_3_completo_stage_1.h5")
 cp = data["BoundaryValues_CoefPressure"].T
 cp = cp[:, np.newaxis, :]
 alpha, mach = torch.tensor(data.get_variable('aoa')).float(), torch.tensor(data.get_variable('M')).float()
 print(f"Loaded data: cp shape {cp.shape}, alpha shape {alpha.shape}, mach shape {mach.shape}")
 
-split_data = np.load(DATA_DIR / 'best_train-val-test_split.npy', allow_pickle=True).item()
+# split_data = np.load(DATA_DIR / 'best_train-val-test_split.npy', allow_pickle=True).item()
+with open(DATA_DIR / "tifon_split_complete.json") as f:
+    split_data = json.load(f)
+
 all_conds = torch.stack((alpha, mach), dim=1).numpy()
-train_indices = get_split_indices("Train", split_data, all_conds)
-val_indices = get_split_indices("Validation", split_data, all_conds)
-test_indices = get_split_indices("Test", split_data, all_conds)
+train_indices = get_split_indices("train", split_data, all_conds)
+val_indices = get_split_indices("validation", split_data, all_conds)
+test_indices = get_split_indices("test", split_data, all_conds)
 sanity_check_splits(split_data, all_conds)
 
 train_cp, train_conds = cp[train_indices], all_conds[train_indices]
@@ -89,9 +92,9 @@ test_cp = (test_cp - cp_mean) / cp_std
 
 pad_length = 13872 # divisible by 16
 original_length = cp.shape[2]
-# train_cp = np.pad(train_cp, ((0, 0), (0, 0), (0, pad_length - train_cp.shape[2])), mode='constant')
-# val_cp = np.pad(val_cp, ((0, 0), (0, 0), (0, pad_length - val_cp.shape[2])), mode='constant')
-# test_cp = np.pad(test_cp, ((0, 0), (0, 0), (0, pad_length - test_cp.shape[2])), mode='constant')
+train_cp = np.pad(train_cp, ((0, 0), (0, 0), (0, pad_length - train_cp.shape[2])), mode='constant')
+val_cp = np.pad(val_cp, ((0, 0), (0, 0), (0, pad_length - val_cp.shape[2])), mode='constant')
+test_cp = np.pad(test_cp, ((0, 0), (0, 0), (0, pad_length - test_cp.shape[2])), mode='constant')
 print(f"After padding, cp shapes: train {train_cp.shape}, val {val_cp.shape}, test {test_cp.shape}")
 
 conds_mean, conds_std = train_conds.mean(axis=0), train_conds.std(axis=0)
@@ -105,6 +108,21 @@ train_dataset = TensorDataset(torch.tensor(train_cp).float(), torch.tensor(train
 val_dataset = TensorDataset(torch.tensor(val_cp).float(), torch.tensor(val_conds).float())
 test_dataset = TensorDataset(torch.tensor(test_cp).float(), torch.tensor(test_conds).float())
 
+# model = Unet1D(
+#     dim=128,
+#     dim_mults=(1, 2, 4),  # , 8),
+#     # flash_attn = False,
+#     channels=1,  
+#     cond_dim=2,
+#     cond_drop_prob=0.2,
+#     attn_dim_head=64,
+#     attn_heads=8,
+#     learn_sigma=False,
+#     # self_condition=True,
+#     # full_attn=True,
+#     # qknorm=True
+# )
+
 model = DiT(
     depth=6,
     hidden_size=128,
@@ -116,11 +134,12 @@ model = DiT(
     in_channels=1,
     learn_sigma=False,
     use_swiglu=True,
-    use_rope=True,
+    # use_rope=True,
     # qk_norm=True, # when bf16 training
     attn_type="vanilla",  # window, linear, vanilla
     mlp_ratio=2.5,
 )
+
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 sampler = Sampler(transport=create_transport(
     # use_cosine_loss=True,
@@ -137,7 +156,7 @@ diffusion = FlowMatching(
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/tifon/dit_2_xxs_bs16_no_pad'
+results_folder = 'results/tifon_new_split/dit_xxs_2'
 train_steps = 300000
 trainer = Trainer1D(
     diffusion,
@@ -159,7 +178,7 @@ trainer = Trainer1D(
     compile_model=True,
     split_batches=True
 )
-# trainer.load(13)
+trainer.load(4)
 trainer.train()
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 
