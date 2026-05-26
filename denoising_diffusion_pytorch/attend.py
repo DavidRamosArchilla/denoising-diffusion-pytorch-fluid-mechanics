@@ -265,6 +265,88 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+# https://github.com/thuml/Transolver/blob/75e0f67643806a81cd1d3f6adc88dd8c02416fe7/Airfoil-Design-AirfRANS/models/Transolver.py#L11
+class PhysicsAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        attn_drop=0.0,
+        slice_num=64,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        proj_drop: float = 0.0,
+        proj_bias: bool = True,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        dim_head = dim // num_heads
+        inner_dim = dim_head * num_heads
+        self.dim_head = dim_head
+        self.heads = num_heads
+        self.scale = dim_head ** -0.5
+        self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(attn_drop)
+        self.temperature = nn.Parameter(torch.ones([1, num_heads, 1, 1]) * 0.5)
+
+        self.in_project_x = nn.Linear(dim, inner_dim)
+        self.in_project_fx = nn.Linear(dim, inner_dim)
+        self.in_project_slice = nn.Linear(dim_head, slice_num)
+        for l in [self.in_project_slice]:
+            torch.nn.init.orthogonal_(l.weight)  # use a principled initialization
+        self.to_q = nn.Linear(dim_head, dim_head, bias=qkv_bias)
+        self.to_k = nn.Linear(dim_head, dim_head, bias=qkv_bias)
+        self.to_v = nn.Linear(dim_head, dim_head, bias=qkv_bias)
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(proj_drop)
+        )
+
+    def forward(self, x, rope=None, mask=None):
+        B, N, C = x.shape
+
+        ### (1) Slice
+        fx_mid = self.in_project_fx(x).reshape(B, N, self.heads, self.dim_head) \
+            .permute(0, 2, 1, 3).contiguous()          # B H N C
+        x_mid = self.in_project_x(x).reshape(B, N, self.heads, self.dim_head) \
+            .permute(0, 2, 1, 3).contiguous()          # B H N C
+
+        slice_weights = self.softmax(
+            self.in_project_slice(x_mid) / self.temperature
+        )                                              # B H N G
+
+        # ── apply mask ──────────────────────────────────────────────────────
+        if mask is not None:
+            # mask: B N  (1 = keep, 0 = pad)
+            slice_weights = slice_weights * mask.float()[:, None, :, None]
+        # ────────────────────────────────────────────────────────────────────
+
+        slice_norm  = slice_weights.sum(2)             # B H G
+        slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
+        slice_token = slice_token / (
+            (slice_norm + 1e-5)[:, :, :, None]
+            .repeat(1, 1, 1, self.dim_head)
+        )
+
+        ### (2) Attention among slice tokens  (no mask needed)
+        q = self.to_q(slice_token)
+        k = self.to_k(slice_token)
+        v = self.to_v(slice_token)
+
+        # dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        # attn = self.dropout(self.softmax(dots))
+        # out_slice_token = torch.matmul(attn, v)        # B H G D
+        out_slice_token = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            scale=self.scale,        # omit to let sdpa compute 1/√D itself
+        ) 
+
+        ### (3) Deslice  (slice_weights already masked → padded rows ≈ 0)
+        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        out_x = rearrange(out_x, 'b h n d -> b n (h d)')
+        return self.to_out(out_x)
+
 
 class CrossAttention(nn.Module):
     """
