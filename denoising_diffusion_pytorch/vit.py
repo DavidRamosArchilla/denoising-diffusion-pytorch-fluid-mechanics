@@ -3,12 +3,12 @@ import torch
 
 
 class ViT(DiT):
-    def __init__(self, out_channels, use_coord_pe=True, coord_dim=None, *args, **kwargs):
+    def __init__(self, out_channels, use_coord_pe=True, coord_dim=None, num_frequencies=32, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_coord_pe = use_coord_pe
         if use_coord_pe:
             assert coord_dim is not None
-            self.coord_pe = CoordEmbedder(kwargs["hidden_size"], coord_dim=coord_dim)
+            self.coord_pe = CoordEmbedder(kwargs["hidden_size"], coord_dim=coord_dim, num_frequencies=num_frequencies)
 
         self.out_channels = out_channels
         self.final_layer = FinalLayer1D(kwargs["hidden_size"], self.patch_size, self.out_channels, bias=True)
@@ -26,6 +26,7 @@ class ViT(DiT):
         c = y                                # (N, D)
         for block in self.blocks:
             # x = checkpoint(block, x, c, self.feat_rope, use_reentrant=False)
+            #TODO: esto no hay que quitarlo
             x = block(x, c, self.feat_rope, mask)                      # (N, T, D)
         x = self.final_layer(x, c)               # (B, num_patches, patch_size * out_channels)
         x = self.unpatchify(x)                   # (B, out_channels, S)

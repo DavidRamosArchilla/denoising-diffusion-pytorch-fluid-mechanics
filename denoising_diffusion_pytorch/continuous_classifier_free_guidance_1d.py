@@ -532,6 +532,18 @@ class Unet1D(Module):
         interpolated_rescaled_logits = rescaled_logits * rescaled_phi + scaled_logits * (1. - rescaled_phi)
 
         return interpolated_rescaled_logits
+        
+    def get_2d_params(self):
+        """
+        Return parameters suitable for Muon optimizer (2D+ parameters like weight matrices).
+        """
+        return [p for p in self.parameters() if p.dim() == 2]
+
+    def get_1d_params(self):
+        """
+        Return parameters not suitable for Muon optimizer (1D parameters like biases).
+        """
+        return [p for p in self.parameters() if p.dim() != 2]
     
     def forward_with_dpmsolver(self, x, timestep, y, mask=None, **kwargs):
         """
@@ -1211,6 +1223,7 @@ class Trainer1D(object):
                 reduce_dtype=torch.float32,   # reduce-scatter in fp32
             ),
         )
+        self.amp = amp
         self.accelerator = Accelerator(
             mixed_precision = mixed_precision_type if amp else 'no',
             cpu=use_cpu,
@@ -1248,6 +1261,7 @@ class Trainer1D(object):
         # dataset and dataloader
 
         dl = DataLoader(dataset, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=4, persistent_workers=True, collate_fn=dataloader_collate_fn)
+        self.dataloader_collate_fn = dataloader_collate_fn
         if dataset_test is not None:
             self.dl_test = DataLoader(dataset_test, batch_size = train_batch_size, shuffle=False, pin_memory=True, num_workers=4, collate_fn=dataloader_collate_fn)
         else:
@@ -1260,7 +1274,7 @@ class Trainer1D(object):
         eps = 1e-6 if mixed_precision_type == 'fp16' or mixed_precision_type == 'bf16' else 1e-8
         if use_muon:
             # Separate parameters for Muon (2D) and AdamW (1D)
-            neural_net = diffusion_model.model
+            neural_net = diffusion_model.neural_net if hasattr(diffusion_model, "neural_net") else diffusion_model
             muon_params = neural_net.get_2d_params()
             adam_params = neural_net.get_1d_params()
             self.opt_muon = torch.optim.Muon(muon_params, lr=train_lr, weight_decay=1e-3)
@@ -1308,6 +1322,17 @@ class Trainer1D(object):
             self.model = torch.compile(self.model) # mode="reduce-overhead"
             # self.model.neural_net = torch.compile(self.model.neural_net) # mode="reduce-overhead"
             print("Model compiled")
+
+        # neural_net = self.model.neural_net if hasattr(self.model, "neural_net") else self.model
+        # neural_net_ddp, self.opt = self.accelerator.prepare(neural_net, self.opt)
+        # if compile_model:
+        #     print("Compiling model...")
+        #     # self.model = torch.compile(self.model, mode="max-autotune-no-cudagraphs") # mode="reduce-overhead"
+        #     if hasattr(self.model, "neural_net"):
+        #         self.model.neural_net = torch.compile(neural_net_ddp, mode="max-autotune-no-cudagraphs") # mode="reduce-overhead"  -no-cudagraphs mode="max-autotune-no-cudagraphs"
+        #     else:
+        #         self.model = torch.compile(neural_net_ddp, mode="max-autotune-no-cudagraphs")
+        #     print("Model compiled")
 
         self.loss_history = []
         self.test_loss_history = []
@@ -1363,11 +1388,13 @@ class Trainer1D(object):
             # Load both optimizers
             for i, opt in enumerate(self.opts):
                 opt.load_state_dict(data["opts"][i])
+                # pass
         else:
             # Load single optimizer
             try: # for older versions where "opts" was not a list
                 self.opt.load_state_dict(data["opt"])
-            except:
+            except Exception as e:
+                print(f"Error occurred while loading optimizer state dict: {e}")
                 self.opt.load_state_dict(data["opts"][0])
         
         if self.accelerator.is_main_process:
@@ -1511,7 +1538,7 @@ class Trainer1D(object):
                         #             test_losses.append(mse.cpu().numpy())
 
                         #     all_samples = torch.cat(all_samples_list, dim = 0)
-                            samples, sequences = self.eval_model(self.dl_test.dataset, batch_size=self.batch_size)
+                            samples, sequences = self.eval_model(self.dl_test.dataset, batch_size=self.batch_size, use_autocast=True) # , pad_output=True
                             if accelerator.is_main_process:
                                 mse = ((samples - sequences) ** 2).mean()
                                 test_losses = mse.cpu().item()
@@ -1532,10 +1559,10 @@ class Trainer1D(object):
         accelerator.print('training complete')
         # profiler.__exit__(None, None, None)
     
-    def eval_model(self, dataset_test, batch_size=32, use_autocast=False, **sampling_kwargs):
+    def eval_model(self, dataset_test, batch_size=32, use_autocast=False, pad_output=False, **sampling_kwargs):
         # Prepare models
-        dl_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=4)
-        
+        dl_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=4, collate_fn=self.dataloader_collate_fn)
+
         # Accelerate handles moving the model to the correct device even on 1 GPU
         model, test_dataloader = self.accelerator.prepare(self.ema.ema_model, dl_test)
         model.eval()
@@ -1575,25 +1602,44 @@ class Trainer1D(object):
                 
             del pred
             del gathered_pred
-            del classes
             del sequence
             
         if self.accelerator.is_main_process:
-            return torch.cat(all_preds, dim=0), torch.cat(all_seqs, dim=0)
+            if pad_output:
+                max_len = max(pred.shape[-1] for pred in all_preds)
+                padded_preds = []
+                padded_seqs = []
+                for pred, seq in zip(all_preds, all_seqs):
+                    pad_size = max_len - pred.shape[-1]
+                    # if self.model.seq_index == 1:
+                    #     pred_padded = F.pad(pred, (0, 0, 0, pad_size))
+                    #     seq_padded = F.pad(seq, (0, 0, 0, pad_size))
+                    # else:
+                    #     pred_padded = F.pad(pred, (0, pad_size, 0, 0))
+                    #     seq_padded = F.pad(seq, (0, pad_size, 0, 0))
+                    # pred has shape (B, C, L) and seq has shape (B, C, L)
+                    pred_padded = F.pad(pred, (0, pad_size))
+                    seq_padded = F.pad(seq, (0, pad_size))
+                    padded_preds.append(pred_padded)
+                    padded_seqs.append(seq_padded)
+                return torch.cat(padded_preds, dim=0), torch.cat(padded_seqs, dim=0)
+            else:
+                return torch.cat(all_preds, dim=0), torch.cat(all_seqs, dim=0)
         return None, None
     
     def save_loss_plot(self):
         plt.figure()
         plt.plot(self.loss_history, label='Loss')
-        if self.test_loss_history:
-            test_x_values = list(range(self.save_and_sample_every, self.step+1, self.save_and_sample_every))
-            # print(test_x_values, self.test_loss_history)
-            plt.plot(test_x_values, self.test_loss_history, label='Test Loss')    
         # Compute moving average
         window_size = 100
         if len(self.loss_history) >= window_size:
             moving_avg = np.convolve(self.loss_history, np.ones(window_size)/window_size, mode='valid')
             plt.plot(range(window_size-1, len(self.loss_history)), moving_avg, label=f'Moving Avg ({window_size})')
+            
+        if self.test_loss_history:
+            test_x_values = list(range(self.save_and_sample_every, self.step+1, self.save_and_sample_every))
+            # print(test_x_values, self.test_loss_history)
+            plt.plot(test_x_values, self.test_loss_history, label='Validation Loss')    
         plt.yscale('log')
         plt.xlabel('Training Steps')
         plt.ylabel('Loss (log scale)')

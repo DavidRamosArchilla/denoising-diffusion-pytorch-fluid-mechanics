@@ -154,6 +154,7 @@ class Attention(nn.Module):
         proj_drop: float = 0.,
         proj_bias: bool = True,
         fused_attn: bool = True,
+        **kwargs
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -272,7 +273,7 @@ class PhysicsAttention(nn.Module):
         dim,
         num_heads=8,
         attn_drop=0.0,
-        slice_num=64,
+        slice_num=128,
         qkv_bias: bool = False,
         qk_norm: bool = False,
         proj_drop: float = 0.0,
@@ -322,7 +323,8 @@ class PhysicsAttention(nn.Module):
         # ────────────────────────────────────────────────────────────────────
 
         slice_norm  = slice_weights.sum(2)             # B H G
-        slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
+        # slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
+        slice_token = slice_weights.transpose(-2, -1) @ fx_mid 
         slice_token = slice_token / (
             (slice_norm + 1e-5)[:, :, :, None]
             .repeat(1, 1, 1, self.dim_head)
@@ -332,6 +334,7 @@ class PhysicsAttention(nn.Module):
         q = self.to_q(slice_token)
         k = self.to_k(slice_token)
         v = self.to_v(slice_token)
+        # TODO: add qknorm
 
         # dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
         # attn = self.dropout(self.softmax(dots))
@@ -343,7 +346,8 @@ class PhysicsAttention(nn.Module):
         ) 
 
         ### (3) Deslice  (slice_weights already masked → padded rows ≈ 0)
-        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        # out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        out_x = slice_weights @ out_slice_token 
         out_x = rearrange(out_x, 'b h n d -> b n (h d)')
         return self.to_out(out_x)
 
@@ -363,6 +367,7 @@ class CrossAttention(nn.Module):
         proj_bias: bool = True,
         fused_attn: bool = True,
         context_dim: int = None,  # if None, defaults to dim (symmetric)
+        **kwargs
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'

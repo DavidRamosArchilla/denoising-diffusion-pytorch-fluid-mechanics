@@ -19,7 +19,7 @@ from einops import repeat, rearrange, pack, unpack
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Mlp # Attention
-from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention, WindowAttention, CrossAttention, LinearCrossAttention, AttentionCP
+from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention, WindowAttention, CrossAttention, LinearCrossAttention, AttentionCP, PhysicsAttention
 from functools import partial
 from .basic_modules import SwiGLUFFN
 # from . import is_triton_module_available
@@ -165,6 +165,8 @@ class DiTBlock(nn.Module):
             self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
         elif attn_type == "linear":
             self.attn = LinearAttention(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
+        elif attn_type == "physics":
+            self.attn = PhysicsAttention(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
         elif attn_type == "triton_linear":
             # if not _triton_modules_available:
             #     raise ValueError(
@@ -546,7 +548,8 @@ class DiT(nn.Module):
         use_swiglu=False,
         use_rope=False,
         attn_type="vanilla",
-        window_size=64,
+        window_size=64, # for window attention
+        slice_num=128, # for physics attention
         qk_norm=False,
         num_experts=None,
         num_experts_per_tok=None,
@@ -558,6 +561,7 @@ class DiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.hidden_size = hidden_size
         self.cond_dim = cond_dim
         self.self_condition = False  # Not used in DiT, this is here for interface compatibility
         if isinstance(input_size, int):
@@ -585,7 +589,7 @@ class DiT(nn.Module):
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         print(f"Creating DiT with {num_patches} patches.")
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        # self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
         block_class = partial(WindowBlock, window_size=window_size) if attn_type == "window" else DiTBlock
         self.blocks = nn.ModuleList(
             [
@@ -599,6 +603,7 @@ class DiT(nn.Module):
                     qk_norm=qk_norm,
                     num_experts=num_experts,
                     num_experts_per_tok=num_experts_per_tok,
+                    slice_num=slice_num
                 )
                 for _ in range(depth)
             ]
@@ -618,10 +623,11 @@ class DiT(nn.Module):
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
         pos_embed = get_1d_sincos_pos_embed(
-            self.pos_embed.shape[-1], 
+            self.hidden_size, 
             self.x_embedder.num_patches
         )
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        # register as buffer so it won't get returned by model.parameters()
+        self.register_buffer("pos_embed", torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
@@ -666,13 +672,13 @@ class DiT(nn.Module):
         """
         Return parameters suitable for Muon optimizer (2D+ parameters like weight matrices).
         """
-        return [p for p in self.parameters() if p.dim() >= 2]
+        return [p for p in self.parameters() if p.dim() == 2]
 
     def get_1d_params(self):
         """
         Return parameters not suitable for Muon optimizer (1D parameters like biases).
         """
-        return [p for p in self.parameters() if p.dim() < 2]
+        return [p for p in self.parameters() if p.dim() != 2]
 
     def forward(self, x, t, classes, mask=None, return_act=False, *args, **kwargs):
         """
@@ -829,16 +835,19 @@ class DiTBlockMultiShape(nn.Module):
     """
     In Sana implementation they use cross attn + self attn. TODO: consider this approach too
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, bias=True, use_swiglu=False, attn_type="vanilla", qk_norm=False, num_experts=None, num_experts_per_tok=None):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, bias=True, use_swiglu=False, attn_type="vanilla", qk_norm=False, num_experts=None, num_experts_per_tok=None, **attn_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=bias)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=bias)
         if attn_type == "vanilla":
-            self.self_attn = Attention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm)
-            self.cross_attn = CrossAttention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm)
+            self.self_attn = Attention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm, **attn_kwargs)
+            self.cross_attn = CrossAttention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm, **attn_kwargs)
         elif attn_type == "linear":
-            self.self_attn = LinearAttention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm)
-            self.cross_attn = LinearCrossAttention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm)
+            self.self_attn = LinearAttention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm, **attn_kwargs)
+            self.cross_attn = LinearCrossAttention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm, **attn_kwargs)
+        elif attn_type == "physics":
+            self.self_attn = PhysicsAttention(hidden_size, num_heads=num_heads, qkv_bias=bias, proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
+            self.cross_attn = CrossAttention(hidden_size, num_heads, proj_bias=bias, qkv_bias=bias, qk_norm=qk_norm, **attn_kwargs)
         else:
             raise ValueError(f"Unsupported attention type for DiTMultiShape: {attn_type}")
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -1042,6 +1051,7 @@ class CoordEmbedder(nn.Module):
     def __init__(self, embed_dim, coord_dim=3, num_frequencies=32):
         super().__init__()
         in_dim = coord_dim * 2 * num_frequencies
+        self.num_frequencies = num_frequencies
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, embed_dim),
             nn.GELU(),
@@ -1053,7 +1063,7 @@ class CoordEmbedder(nn.Module):
         coords: (B, N, C) where C is 2 or 3
         out: (B, N, embed_dim)
         """
-        enc = fourier_encode(coords.flatten(0, 1))      # (B*N, C*2F)
+        enc = fourier_encode(coords.flatten(0, 1), self.num_frequencies)      # (B*N, C*2F)
         # print(enc.shape, coords.shape, coords.flatten(0, 1).shape)
         emb = self.mlp(enc)                              # (B*N, embed_dim)
         return emb.view(*coords.shape[:2], -1)           # (B, N, embed_dim)
