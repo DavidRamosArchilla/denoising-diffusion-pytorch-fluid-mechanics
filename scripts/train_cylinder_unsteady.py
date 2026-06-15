@@ -70,9 +70,9 @@ train_dataset = TensorDataset(fields_train, conds_train)
 test_dataset = TensorDataset(fields_test, conds_test)
 
 model = DiT(
-    depth=8,
+    depth=12,
     hidden_size=256,
-    patch_size=8,
+    patch_size=4,
     num_frames=fields_train.shape[1],
     num_heads=8,
     input_size=fields_train.shape[-1], # dataset grid size
@@ -103,16 +103,16 @@ diffusion = FlowMatching(
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/cylinder_nvidia/first_8'
+results_folder = 'results/cylinder_nvidia/deeper_4'
 train_steps = 100000
 trainer = Trainer1D(
     diffusion,
     dataset=train_dataset,
     dataset_test=test_dataset, # small_val_dataset is to avoid timeout when training on 2 GPUs
-    train_batch_size=16,
+    train_batch_size=4,
     train_lr=1e-4,
     train_num_steps=train_steps,  # total training steps
-    gradient_accumulate_every=1,  # gradient accumulation steps
+    gradient_accumulate_every=4,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
     amp=True,     # turn on mixed precision
     mixed_precision_type='bf16',

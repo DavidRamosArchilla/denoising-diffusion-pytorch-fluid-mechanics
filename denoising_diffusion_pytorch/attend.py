@@ -294,10 +294,18 @@ class PhysicsAttention(nn.Module):
         self.in_project_fx = nn.Linear(dim, inner_dim)
         self.in_project_slice = nn.Linear(dim_head, slice_num)
         for l in [self.in_project_slice]:
-            torch.nn.init.orthogonal_(l.weight)  # use a principled initialization
+            torch.nn.init.orthogonal_(l.weight)
         self.to_q = nn.Linear(dim_head, dim_head, bias=qkv_bias)
         self.to_k = nn.Linear(dim_head, dim_head, bias=qkv_bias)
         self.to_v = nn.Linear(dim_head, dim_head, bias=qkv_bias)
+
+        # ── qk_norm ──────────────────────────────────────────────────────────
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm = nn.RMSNorm(dim_head)
+            self.k_norm = nn.RMSNorm(dim_head)
+        # ─────────────────────────────────────────────────────────────────────
+
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(proj_drop)
@@ -316,38 +324,36 @@ class PhysicsAttention(nn.Module):
             self.in_project_slice(x_mid) / self.temperature
         )                                              # B H N G
 
-        # ── apply mask ──────────────────────────────────────────────────────
         if mask is not None:
-            # mask: B N  (1 = keep, 0 = pad)
             slice_weights = slice_weights * mask.float()[:, None, :, None]
-        # ────────────────────────────────────────────────────────────────────
 
         slice_norm  = slice_weights.sum(2)             # B H G
-        # slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
-        slice_token = slice_weights.transpose(-2, -1) @ fx_mid 
+        slice_token = slice_weights.transpose(-2, -1) @ fx_mid
         slice_token = slice_token / (
             (slice_norm + 1e-5)[:, :, :, None]
             .repeat(1, 1, 1, self.dim_head)
         )
 
-        ### (2) Attention among slice tokens  (no mask needed)
+        ### (2) Attention among slice tokens
         q = self.to_q(slice_token)
         k = self.to_k(slice_token)
         v = self.to_v(slice_token)
-        # TODO: add qknorm
 
-        # dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        # attn = self.dropout(self.softmax(dots))
-        # out_slice_token = torch.matmul(attn, v)        # B H G D
+        # ── qk_norm ──────────────────────────────────────────────────────────
+        if self.qk_norm:
+            dtype = q.dtype
+            q = self.q_norm(q.to(self.q_norm.weight.dtype)).to(dtype)
+            k = self.k_norm(k.to(self.k_norm.weight.dtype)).to(dtype)
+        # ─────────────────────────────────────────────────────────────────────
+
         out_slice_token = F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.dropout.p if self.training else 0.0,
-            scale=self.scale,        # omit to let sdpa compute 1/√D itself
-        ) 
+            scale=self.scale,
+        )
 
-        ### (3) Deslice  (slice_weights already masked → padded rows ≈ 0)
-        # out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
-        out_x = slice_weights @ out_slice_token 
+        ### (3) Deslice
+        out_x = slice_weights @ out_slice_token
         out_x = rearrange(out_x, 'b h n d -> b n (h d)')
         return self.to_out(out_x)
 
