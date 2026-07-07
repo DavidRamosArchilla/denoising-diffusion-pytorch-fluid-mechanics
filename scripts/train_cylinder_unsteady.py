@@ -70,9 +70,9 @@ train_dataset = TensorDataset(fields_train, conds_train)
 test_dataset = TensorDataset(fields_test, conds_test)
 
 model = DiT(
-    depth=12,
+    depth=8,
     hidden_size=256,
-    patch_size=4,
+    patch_size=2,
     num_frames=fields_train.shape[1],
     num_heads=8,
     input_size=fields_train.shape[-1], # dataset grid size
@@ -103,7 +103,7 @@ diffusion = FlowMatching(
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/cylinder_nvidia/deeper_4'
+results_folder = 'results/cylinder_nvidia/depth_8_p2'
 train_steps = 100000
 trainer = Trainer1D(
     diffusion,
@@ -126,8 +126,8 @@ trainer = Trainer1D(
     split_batches=True
 )
 # trainer.load(5)
-trainer.train()
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
+trainer.train()
 
 samples, seqs = trainer.eval_model(test_dataset, batch_size=8, use_autocast=True)
 
