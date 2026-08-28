@@ -25,7 +25,7 @@ from einops import repeat, rearrange, pack, unpack
 import numpy as np
 from timm.models.vision_transformer import PatchEmbed, Mlp
 
-from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention, WindowAttention
+from .attend import Attention, VisionRotaryEmbeddingFast, LinearAttention, WindowAttention, PhysicsAttention
 from .basic_modules import SwiGLUFFN
 
 import math
@@ -137,6 +137,9 @@ class DiTBlock(nn.Module):
         elif attn_type == "linear":
             self.attn = LinearAttention(hidden_size, num_heads=num_heads, qkv_bias=bias,
                                         proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
+        elif attn_type == "physics":
+            self.attn = PhysicsAttention(hidden_size, num_heads=num_heads, qkv_bias=bias,
+                                         proj_bias=bias, qk_norm=qk_norm, **attn_kwargs)
         else:
             self.attn = None
 
@@ -426,6 +429,7 @@ class DiT(nn.Module):
         self.factorize    = factorize                          # ← NEW
 
         # ── Patch embedder & final layer ──────────────────────────────────────
+        self.input_size = input_size
         if isinstance(input_size, int):
             self.is_1d = True
             if self.is_video:                                  # ← NEW branch
@@ -453,7 +457,7 @@ class DiT(nn.Module):
         if use_rope and self.is_1d:
             head_dim = hidden_size // num_heads
             # For video, spatial sequence length is still input_size // patch_size
-            seq_len  = input_size // patch_size
+            seq_len = input_size // patch_size
             self.feat_rope = VisionRotaryEmbeddingFast(dim=head_dim, max_seq_len=seq_len)
         else:
             if use_rope and not self.is_1d:
@@ -598,8 +602,9 @@ class DiT(nn.Module):
                 x = x.permute(0, 1, 4, 2, 3)              # (B, F, C, S, p)
                 x = x.reshape(x.shape[0], F, c, S * p)    # (B, F, C, seq_len)
             else:
-                h = w = int(S ** 0.5)
-                assert h * w == S, "Spatial patch count must form a square grid"
+                h = self.input_size[0] // p
+                w = self.input_size[1] // p
+                # assert h * w == S, "Spatial patch count must form a square grid"
                 x = x.reshape(x.shape[0], F, h, w, p, p, c)
                 x = x.permute(0, 1, 6, 2, 4, 3, 5)        # (B, F, C, h, p, w, p)
                 x = x.reshape(x.shape[0], F, c, h * p, w * p)   # (B, F, C, H, W)
@@ -611,7 +616,8 @@ class DiT(nn.Module):
                 x = x.permute(0, 3, 1, 2)
                 x = x.reshape(x.shape[0], c, num_patches * p)
             else:
-                h = w = int(num_patches ** 0.5)
+                h = self.input_size[0]
+                w = self.input_size[1]
                 assert h * w == num_patches
                 x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
                 x = torch.einsum('nhwpqc->nchpwq', x)
