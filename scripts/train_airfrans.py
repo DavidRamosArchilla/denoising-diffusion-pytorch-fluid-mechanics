@@ -27,15 +27,15 @@ coefficients = {
 data_file_test = 'data/airfrans/dataset_test_ordered.pt' # ordered_dataset processed_data
 data_test = torch.load(data_file_test, weights_only=False)
 pressures_test, coords_test, conditions_test = data_test["pressures"], data_test["coords"], data_test["conditions"]
-test_dataset = AirfoilDataset(pressures_test, coords_test, conditions_test, coefficients=coefficients)
+test_dataset = AirfoilDataset(pressures_test, coords_test, conditions_test, coefficients=coefficients, max_len=train_dataset.max_len)
 
 # train_dataset, val_dataset = torch.utils.data.random_split(dataset, [0.8, 0.2], generator=torch.Generator().manual_seed(42))
 data_sample = train_dataset[:]
 print(f"Data sample: pressure shape {data_sample[0].shape}, condition shape {data_sample[1].shape}, coords shape {data_sample[2].shape}, mask shape {data_sample[3].shape}")
 
 model = DiTMultiShape(
-    depth=8,
-    hidden_size=256,
+    depth=6,
+    hidden_size=128,
     patch_size=1,
     num_heads=4,
     context_channels=data_sample[2].shape[1],
@@ -48,17 +48,18 @@ model = DiTMultiShape(
     use_swiglu=True,
     use_rope=True,
     # qk_norm=True,
-    attn_type="vanilla",  # window, linear, vanilla
+    attn_type="physics",  # window, linear, vanilla, physics
+    slice_num=128,
     # window_size=107,
     # num_experts=8,
     # num_experts_per_tok=2
-    mlp_ratio=2.5,
+    mlp_ratio=4,
 )
 print("Number of parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
 sampler = Sampler(transport=create_transport(
     # use_cosine_loss=True,
-    use_lognorm=True
+    # use_lognorm=True
 ))
 
 diffusion = FlowMatching(
@@ -71,8 +72,8 @@ diffusion = FlowMatching(
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/airfrans_good_split/dit_s_coordPE_on_both_cross_self_attn_lognorm_rope'
-train_steps = 300000
+results_folder = 'results/airfrans_good_split/dit_xxs_physics_attn'
+train_steps = 360000
 trainer = Trainer1D(
     diffusion,
     dataset=train_dataset,
@@ -83,8 +84,8 @@ trainer = Trainer1D(
     train_num_steps=train_steps,  # total training steps
     gradient_accumulate_every=1,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
-    amp=True,     # turn on mixed precision
-    mixed_precision_type='bf16',
+    # amp=True,     # turn on mixed precision
+    # mixed_precision_type='bf16',
     results_folder=results_folder,  # folder to save results to
     save_and_sample_every=20000,
     eta_min_scheduler=1e-6,
@@ -99,6 +100,7 @@ trainer = Trainer1D(
 # trainer.load(2)
 trainer.train(do_profiling=False)
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
+samples, seqs = trainer.eval_model(test_dataset, batch_size=32) # , cfg_interval_start=0.2
 
 if trainer.accelerator.is_main_process:
     diffusion = trainer.accelerator.unwrap_model(diffusion, keep_torch_compile=True)
@@ -106,23 +108,15 @@ if trainer.accelerator.is_main_process:
     diffusion.eval()
     original_length = train_dataset.max_len
     test_data, test_parameters, *_ = test_dataset[:]
-    # errors, samples = evaluate_model(
-    #     trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion
-    #     test_parameters,
-    #     test_data,
-    #     32,
-    #     cond_scale=2
-    # )
-    # samples = samples[:, :original_length]  # Remove padding if it was added
-    # print(f"Final errors:\n{errors}")
-    # torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
+    torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
 
-    # from cetaceo.evaluators import RegressionEvaluator
-    # # preds = preds * (cp_max - cp_min) + cp_min
-    # samples = (samples * dataset.p_std) + dataset.p_mean
-    # test_data = (test_data * dataset.p_std) + dataset.p_mean
+    from cetaceo.evaluators import RegressionEvaluator
+    # preds = preds * (cp_max - cp_min) + cp_min
+    samples = (samples * train_dataset.p_std) + train_dataset.p_mean
+    test_data = (test_data * train_dataset.p_std) + train_dataset.p_mean
 
-    # evaluator = RegressionEvaluator()
-    # metrics = evaluator(samples, test_data[:, :original_length])
-    # # metrics = evaluator(preds, cp_test) # cp_test
-    # evaluator.print_metrics()
+    evaluator = RegressionEvaluator()
+    print(samples.shape, test_data.shape, test_data[:, :original_length].shape)
+    metrics = evaluator(samples, test_data[:, :original_length])
+    # metrics = evaluator(preds, cp_test) # cp_test
+    evaluator.print_metrics()

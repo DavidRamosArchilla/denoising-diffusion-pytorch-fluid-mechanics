@@ -72,8 +72,9 @@ data_path = "/home/airbus/final_data_airbus/v2/database/clean.h5"
 original_dataset = pyLOM.Dataset.load("/home/airbus/final_data_airbus/v2/database/clean.h5")
 original_cp = original_dataset["CoefPressure"]  # shape (num_samples, num_points)
 print("Original Cp shape:", original_cp.shape)
+zone = 1
 # la zona del htp es la 2, la del ala es la 8, la 1 es la del fuselaje
-htp_cp = original_cp[original_dataset['Zone'][:, -1] == 2]
+htp_cp = original_cp[original_dataset['Zone'][:, -1] == zone]
 print("HTP Cp shape:", htp_cp.shape)
 # print(np.hstack((original_dataset.xyz, original_dataset['Zone'])).shape)
 print(original_dataset.varnames, original_dataset.fieldnames)
@@ -81,11 +82,16 @@ print(len(original_dataset.get_variable("aoa")))
 
 # import code; code.interact(local=locals())
 
-def load_dataset(data, indices, norm_coefficients, FL=None, pad_to=None):
-    aoa = data.get_variable('aoa')[indices]
-    mach = data.get_variable('M')[indices]
+def load_dataset(data, indices, norm_coefficients, FL, pad_to=None):
+    fl_mask = np.array(data.get_variable('FL')) == FL
+    aoa = data.get_variable('aoa')[fl_mask][indices]
+    mach = data.get_variable('M')[fl_mask][indices]
+    print(mach)
     # filter htp zone -- el htp es la zona 2, el ala es la 8
-    cp = data["CoefPressure"][data['Zone'][:, -1] == 2].T
+    # cp = data["CoefPressure"][fl_mask]
+    # print(cp.shape)
+    cp = data["CoefPressure"][data['Zone'][:, -1] == zone].T[fl_mask]
+    print(cp.shape)
     cp = cp[indices]
     # if "cp_min" not in norm_coefficients:
     #     norm_coefficients["cp_min"] = cp.min()
@@ -109,16 +115,11 @@ def load_dataset(data, indices, norm_coefficients, FL=None, pad_to=None):
         pad_width = pad_to - cp.shape[1]
         cp = np.pad(cp, ((0, 0), (0, pad_width)), mode='constant', constant_values=0)
 
-    if FL is not None:
-        fl_mask = np.array(data.get_variable('FL')) == FL
-        cp = cp[fl_mask]
-        aoa = aoa[fl_mask]
-        mach = mach[fl_mask]
-
     cp_t = torch.from_numpy(cp).float().unsqueeze(1)  # add channel dimension
     # cp_t = cp_t[..., :-1]
     aoa_t = torch.from_numpy(aoa).float()
     mach_t = torch.from_numpy(mach).float()
+    print(mach)
     conditions = torch.stack([aoa_t, mach_t], dim=1)
     print(cp.min(), cp.max())
     print(aoa.mean(), aoa.std())
@@ -130,7 +131,7 @@ def load_dataset(data, indices, norm_coefficients, FL=None, pad_to=None):
 norm_coefficients = {}
 original_length = htp_cp.shape[0]
 # 217088 is the closest multiple of 256 (patch size) greater than 217003 (mesh points)
-pad_length = 217088 # 217088 para el htp | 988672 divisible por 64 | 213344 para el fuselaje, divisible por 16
+pad_length = 213344 # 217088 para el htp | 988672 divisible por 64 | 213344 para el fuselaje, divisible por 16
 clean_data = pyLOM.Dataset.load(data_path)
 fl_mask = np.array(clean_data.get_variable('FL')) == 310
 clean_aoa = clean_data.get_variable('aoa')[fl_mask]
@@ -140,7 +141,7 @@ all_conds = torch.from_numpy(np.stack([clean_aoa, clean_mach], axis=1))
 
 print(f"Condition shape: {all_conds.shape}")
 # split_data = np.load("/home/f.gutierrez/CETACEO_UPM/use_cases/aerodynamics/point-wise_mlp/TestCaseBSC/CaseWing/results_TFM/splits/best_train-val-test_split.npy", allow_pickle=True).item()
-with open("/home/airbus/CETACEO_cp_interp/HTP_case/condition_split.json") as f:
+with open("/home/airbus/final_data_airbus/v1/flight_conditions_interpolator/condition_split.json") as f:
     split_data = json.load(f)
 training_indices = get_split_indices("train", split_data, all_conds.numpy())
 validation_indices = get_split_indices("validation", split_data, all_conds.numpy())
@@ -168,9 +169,9 @@ plt.savefig("condition_distribution.png")
 # test_size = len(dataset) - train_size
 # dataset_train, dataset_test = random_split(dataset, [train_size, test_size])
 
-dataset_train = load_dataset(clean_data, training_indices, norm_coefficients, pad_to=pad_length)
-dataset_val = load_dataset(clean_data, validation_indices, norm_coefficients, pad_to=pad_length)
-dataset_test = load_dataset(clean_data, test_indices, norm_coefficients, pad_to=pad_length)
+dataset_train = load_dataset(clean_data, training_indices, norm_coefficients, pad_to=pad_length, FL=310)
+dataset_val = load_dataset(clean_data, validation_indices, norm_coefficients, pad_to=pad_length, FL=310)
+dataset_test = load_dataset(clean_data, test_indices, norm_coefficients, pad_to=pad_length, FL=310)
 
 data_ex = dataset_train[0]
 print(len(dataset_train), len(dataset_test))
@@ -186,6 +187,7 @@ model = DiT(
     in_channels=1,
     learn_sigma=False,
     use_swiglu=True,
+    qk_norm=True,
 )
 
 # diffusion = GaussianDiffusion1D(
@@ -214,14 +216,14 @@ diffusion = FlowMatching(
     sampling_method="euler",
 )
 
-results_folder = 'results/cetaceo_cp/FM_dit_S_16_htp'
+results_folder = 'results/cetaceo_cp_good_split/FM_dit_S_16_fuselaje'
 
 train_steps = 300000
 
 trainer = Trainer1D(
     diffusion,
     dataset=dataset_train,
-    dataset_test=dataset_test,
+    dataset_test=dataset_val,
     train_batch_size=8,
     train_lr=1e-4,
     num_samples=9,
@@ -240,12 +242,13 @@ trainer = Trainer1D(
     split_batches=True
 )
 
-# trainer.load(5)
+trainer.load(7)
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
-trainer.train()
+# trainer.train()
 
 if trainer.accelerator.is_main_process:
     test_data, test_parameters = dataset_test[:]
+    # test_data, test_parameters = dataset_val[:]
     errors, samples = evaluate_model(
         trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion
         test_parameters,
@@ -254,9 +257,9 @@ if trainer.accelerator.is_main_process:
         cond_scale=6
     )
     print(f"Final errors:\n{errors}")
-    torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
-    samples = (samples * dataset_train.p_std) + dataset_train.p_mean
-    test_data = (test_data * dataset_train.p_std) + dataset_train.p_mean
+    torch.save(samples, f"{results_folder}/test_predictions_ema_ckp_7.pt")
+    samples = (samples * norm_coefficients["cp_std"]) + norm_coefficients["cp_mean"]
+    test_data = (test_data * norm_coefficients["cp_std"]) + norm_coefficients["cp_mean"]
     from cetaceo.evaluators import RegressionEvaluator
     evaluator = RegressionEvaluator()
     metrics = evaluator(samples, test_data[:, :original_length])

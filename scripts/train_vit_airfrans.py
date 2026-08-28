@@ -35,7 +35,10 @@ data_sample = train_dataset[:]
 print(f"Data sample: pressure shape {data_sample[0].shape}, condition shape {data_sample[1].shape}, coords shape {data_sample[2].shape}, mask shape {data_sample[3].shape}")
 
 model = ViT(
-    use_coord_pe=True,
+    out_channels=1,
+    use_coord_pe=False,
+    # num_frequencies=64,
+    # coord_dim=2,
     depth=6,
     hidden_size=128,
     patch_size=1,
@@ -48,8 +51,9 @@ model = ViT(
     # use_bias=False,
     use_swiglu=True,
     # use_rope=True,
-    qk_norm=True,
-    attn_type="vanilla",  # window, linear, vanilla
+    # qk_norm=True,
+    attn_type="physics",  # window, linear, vanilla, physics
+    slice_num=128,
     # window_size=107,
     # num_experts=8,
     # num_experts_per_tok=2
@@ -57,60 +61,86 @@ model = ViT(
 )
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))   
 
-results_folder = 'results/airfrans_good_split/vit_xxs_coordPE'
+def no_mask_collate(batch):
+    pressures, conditions, coords, masks = zip(*batch)
+    pressures = torch.stack(pressures)
+    conditions = torch.stack(conditions)
+    coords = torch.stack(coords)
+    masks = torch.stack(masks).unsqueeze(1)
+    p_shape = pressures.shape
+    pressures = pressures[masks]
+    pressures = pressures.view(p_shape[0], p_shape[1], -1)
+    c_shape = coords.shape
+    coords_mask = masks.expand(-1, coords.shape[1], -1)
+    coords = coords[coords_mask]
+    coords = coords.view(c_shape[0], c_shape[1], -1)
+    # print(coords.shape, pressures.shape, conditions.shape)
+    return pressures, conditions, coords, masks
+
+
+results_folder = 'results/airfrans_good_split/vit_xxs_physics_attn_no_coordPE'
 train_steps = 360000
 trainer = Trainer1D(
     model,
     dataset=train_dataset,
     dataset_test=test_dataset, # small_val_dataset is to avoid timeout when training on 2 GPUs
-    train_batch_size=64,
+    train_batch_size=32,
     train_lr=2e-4,
     num_samples=9,
     train_num_steps=train_steps,  # total training steps
     gradient_accumulate_every=1,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
-    amp=True,     # turn on mixed precision
-    mixed_precision_type='bf16',
+    # amp=True,     # turn on mixed precision
+    # mixed_precision_type='bf16',
     results_folder=results_folder,  # folder to save results to
     save_and_sample_every=20000,
     eta_min_scheduler=1e-6,
     max_grad_norm=1.0,
     # use_cpu=True,
-    # use_muon=True,
+    use_muon=True,
     compile_model=True,
-    split_batches=True
+    split_batches=True,
+    # dataloader_collate_fn=no_mask_collate
 )
 # with open(os.path.join(results_folder, 'norm_coefficients.json'), 'w') as f:
 #     json.dump(coefficients, f, indent=4)
 # trainer.load(2)
 trainer.train(do_profiling=False)
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
-samples, seqs = trainer.eval_model(test_dataset, batch_size=32) # , cfg_interval_start=0.2
+samples, seqs = trainer.eval_model(test_dataset, batch_size=32, pad_output=True) # , cfg_interval_start=0.2
+
+def reconstruct_mask(pressures, padded_len: int) -> torch.BoolTensor:
+    """
+    Reconstructs the attention mask from the original unpadded dataset tensors.
+
+    Args:
+        pressures : List of pressure tensors (n_samples, n_points)
+        padded_len : the L dimension of your padded (n_samples, n_points) tensor
+
+    Returns:
+        mask : (n_samples, padded_len) bool — True = real point, False = padding
+    """
+    lengths = torch.tensor([p.shape[0] for p in pressures])  # (n_samples,)
+    mask = torch.arange(padded_len).unsqueeze(0) < lengths.unsqueeze(1)  # (n_samples, L)
+    return mask
 
 if trainer.accelerator.is_main_process:
-    diffusion = trainer.accelerator.unwrap_model(model, keep_torch_compile=True)
-    trainer.ema.ema_model.eval()  # Ensure eval mode
-    diffusion.eval()
-    original_length = train_dataset.max_len
-    test_data, test_parameters, *_ = test_dataset[:]
-    # errors, samples = evaluate_model(
-    #     trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion
-    #     test_parameters,
-    #     test_data,
-    #     32,
-    #     cond_scale=2
-    # )
-    # samples = samples[:, :original_length]  # Remove padding if it was added
-    # print(f"Final errors:\n{errors}")
     torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
+    original_length = train_dataset.max_len
+    test_data, test_parameters, _, test_masks = test_dataset[:]
+    test_masks = test_masks.unsqueeze(1)
+    test_data = test_data[test_masks]
 
-    from cetaceo.evaluators import RegressionEvaluator
-    # preds = preds * (cp_max - cp_min) + cp_min
+    samples_mask = reconstruct_mask(pressures_test, samples.shape[-1])  # (n_samples, L)
+    samples = samples.squeeze()[samples_mask]
     samples = (samples * train_dataset.p_std) + train_dataset.p_mean
     test_data = (test_data * train_dataset.p_std) + train_dataset.p_mean
+    print(test_data.shape, samples.shape)
 
+    from cetaceo.evaluators import RegressionEvaluator
     evaluator = RegressionEvaluator()
-    print(samples.shape, test_data.shape, test_data[:, :original_length].shape)
-    metrics = evaluator(samples, test_data[:, :original_length])
+    # print(samples.shape, test_data.shape, test_data[:, :original_length].shape)
+    # metrics = evaluator(samples, test_data[:, :original_length])
+    metrics = evaluator(samples, test_data)
     # metrics = evaluator(preds, cp_test) # cp_test
     evaluator.print_metrics()

@@ -179,39 +179,39 @@ model = Unet1D(
 #     # num_experts_per_tok=2
 #     mlp_ratio=2.5,
 # )
-# diffusion = GaussianDiffusion1D(
-#     model,
-#     seq_length=dataset.tensors[0].shape[2],
-#     objective="pred_noise",  # 'pred_noise' or 'pred_x0'
-#     beta_schedule="cosine",
-#     sampling_timesteps=1000,
-#     timesteps=1000,  # number of steps
-#     # use_cfg_plus_plus=True,
-#     min_snr_loss_weight=True,
-#     min_snr_gamma=5
-# )
-
-sampler = Sampler(transport=create_transport(
-    # use_cosine_loss=True,
-    # use_lognorm=True
-))
-
-diffusion = FlowMatching(
-    sampler,
+diffusion = GaussianDiffusion1D(
     model,
-    input_size=dataset.tensors[0].shape[2],
-    cond_scale=2,
-    num_sampling_steps=400,
-    sampling_method="euler",
-    # shifted_mu=1.0986
+    seq_length=dataset.tensors[0].shape[2],
+    objective="pred_noise",  # 'pred_noise' or 'pred_x0'
+    beta_schedule="cosine",
+    sampling_timesteps=1000,
+    timesteps=1000,  # number of steps
+    # use_cfg_plus_plus=True,
+    min_snr_loss_weight=True,
+    min_snr_gamma=5
 )
+
+# sampler = Sampler(transport=create_transport(
+#     # use_cosine_loss=True,
+#     # use_lognorm=True
+# ))
+
+# diffusion = FlowMatching(
+#     sampler,
+#     model,
+#     input_size=dataset.tensors[0].shape[2],
+#     cond_scale=2,
+#     num_sampling_steps=400,
+#     sampling_method="euler",
+#     # shifted_mu=1.0986
+# )
 small_val_dataset = torch.utils.data.Subset(val_dataset, np.random.choice(len(val_dataset), 64, replace=False))
 
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9} GB")
 print(f"Model size estimate: {sum(p.numel() for p in model.parameters()) * 4 / 1e9} GB")
 # TIENES LA NORMALIZACION DE LOS DATOS CAMBIADA
-results_folder = 'results/aeronef_cp_good_split/unet_M_attn_correct'
+results_folder = 'results/aeronef_cp_good_split/unet_M_diff'
 
 
 train_steps = 200000

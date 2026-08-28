@@ -5,6 +5,7 @@ torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
 from torch.utils.data import TensorDataset
 import torch.nn.functional as F
+from torch.distributed.distributed_c10d import destroy_process_group
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance_1d import GaussianDiffusion1D, Trainer1D, Unet1D
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance import evaluate_model
 from denoising_diffusion_pytorch.dit import DiT_models, DiT, DiTBlock, DiTCoordPE
@@ -112,21 +113,20 @@ dataset_test = TensorDataset(
 #     # full_attn = False
 # )
 model = DiT(
-    depth=12,
+    depth=8,
     hidden_size=256,
-    patch_size=32,
+    patch_size=2,
     num_heads=8,
     input_size=Y_train.shape[2],
     cond_dim=dataset_train.tensors[1].shape[1],
-    class_dropout_prob=0.2,
+    class_dropout_prob=0.15,
     in_channels=dataset_train.tensors[0].shape[1],
     learn_sigma=False,
     use_swiglu=True,
-    attn_type="vanilla", # linear vanilla triton_linear
+    attn_type="linear", # linear
     qk_norm=True, # to avoid stability issues with bf16
-    mlp_ratio=4,
-    use_rope=True
-    # num_experts=4,
+    mlp_ratio=2.5,
+    # num_experts=8,
     # num_experts_per_tok=2
 )
 # model = DiTCoordPE(
@@ -175,25 +175,25 @@ diffusion = FlowMatching(
     sampler,
     model,
     input_size=dataset_train.tensors[0].shape[2],
-    cond_scale=6,
-    num_sampling_steps=500,
+    cond_scale=2,
+    num_sampling_steps=100,
     sampling_method="euler",
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/onera/dit_S_32_cp_test'
+results_folder = 'results/onera/dit_XS_p2_gradients'
 
-train_steps = 300000
+train_steps = 100000
 
 trainer = Trainer1D(
     diffusion,
     dataset=dataset_train,
-    # dataset_test=dataset_test,
+    dataset_test=dataset_test,
     train_batch_size=8,
     train_lr=2e-4,
     num_samples=9,
-    train_num_steps=train_steps+4,  # total training steps
-    gradient_accumulate_every=4,  # gradient accumulation steps
+    train_num_steps=train_steps,  # total training steps
+    gradient_accumulate_every=2,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
     amp = True,                       # turn on mixed precision
     mixed_precision_type='bf16',
@@ -202,7 +202,7 @@ trainer = Trainer1D(
     eta_min_scheduler=1e-6,
     max_grad_norm=1.0,
     # use_cpu=True,
-    # use_muon=True,
+    use_muon=True,
     compile_model=True, 
     split_batches=True
 )
@@ -226,7 +226,7 @@ trainer = Trainer1D(
 #     # use_muon=True,
 #     # compile_model=True, 
 # )
-# trainer.load(20)
+# trainer.load(15)
 trainer.train()
 # shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 
@@ -242,7 +242,7 @@ if trainer.accelerator.is_main_process:
     test_data, test_parameters = dataset_test.tensors
 
     samples = samples[:, :, :original_length]  # unpad
-    torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
+    torch.save(samples, f"{results_folder}/test_predictions_ema_cfg_2_100_steps.pt")
 
     from cetaceo.evaluators import RegressionEvaluator
     # preds = preds * (cp_max - cp_min) + cp_min
@@ -253,3 +253,5 @@ if trainer.accelerator.is_main_process:
     metrics = evaluator(samples, test_data)
     # metrics = evaluator(preds, cp_test) # cp_test
     evaluator.print_metrics()
+
+destroy_process_group()

@@ -10,7 +10,7 @@ from denoising_diffusion_pytorch.dit import DiT_models, DiTCoordPE, DiT
 from denoising_diffusion_pytorch.transport import create_transport, Sampler, FlowMatching
 
 import torch
-from torch.utils.data import TensorDataset
+from torch.utils.data import TensorDataset, ConcatDataset
 import numpy as np
 import matplotlib.pyplot as plt
 # plt.rcParams.update({
@@ -59,13 +59,11 @@ def sanity_check_splits(split_data, all_conds):
 
     print("✅ Sanity check passed: splits are disjoint and complete.")
 
-SEED = 42
-GENERATOR = torch.Generator().manual_seed(SEED)
-
-DEVICE = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
 DATA_DIR  = Path("/home/airbus/CETACEO_cp_interp/DATA/TIFON")
 
-data = pyLOM.Dataset.load(DATA_DIR / "CADGroup_3_completo_stage_1.h5")
+# data = pyLOM.Dataset.load(DATA_DIR / "CADGroup_3_completo_stage_1.h5")
+data = pyLOM.Dataset.load("/home/airbus/CETACEO_cp_interp/CLUSTERING_TIFON/AIRBUS/database/CADGroup_3_completo_stage_1_reordered.h5")
+coords = data.xyz[:, [0, 2]]
 cp = data["BoundaryValues_CoefPressure"].T
 cp = cp[:, np.newaxis, :]
 alpha, mach = torch.tensor(data.get_variable('aoa')).float(), torch.tensor(data.get_variable('M')).float()
@@ -90,8 +88,8 @@ train_cp = (train_cp - cp_mean) / cp_std
 val_cp = (val_cp - cp_mean) / cp_std
 test_cp = (test_cp - cp_mean) / cp_std
 
-pad_length = 13872 # divisible by 16
 original_length = cp.shape[2]
+pad_length = 13872 # divisible by 16
 train_cp = np.pad(train_cp, ((0, 0), (0, 0), (0, pad_length - train_cp.shape[2])), mode='constant')
 val_cp = np.pad(val_cp, ((0, 0), (0, 0), (0, pad_length - val_cp.shape[2])), mode='constant')
 test_cp = np.pad(test_cp, ((0, 0), (0, 0), (0, pad_length - test_cp.shape[2])), mode='constant')
@@ -107,6 +105,8 @@ print(f"After normalization, condition means: {train_conds.mean(axis=0)}, stds: 
 train_dataset = TensorDataset(torch.tensor(train_cp).float(), torch.tensor(train_conds).float())
 val_dataset = TensorDataset(torch.tensor(val_cp).float(), torch.tensor(val_conds).float())
 test_dataset = TensorDataset(torch.tensor(test_cp).float(), torch.tensor(test_conds).float())
+
+train_dataset_merged = ConcatDataset([train_dataset, val_dataset])
 
 # model = Unet1D(
 #     dim=128,
@@ -124,23 +124,44 @@ test_dataset = TensorDataset(torch.tensor(test_cp).float(), torch.tensor(test_co
 # )
 
 model = DiT(
-    depth=6,
-    hidden_size=128,
-    patch_size=2,
-    num_heads=4,
+    depth=7,
+    hidden_size=512,
+    patch_size=4,
+    num_heads=16,
     input_size=train_cp.shape[2], # dataset grid size
     cond_dim=2, # number of parameters (alpha, mach)
-    class_dropout_prob=0.2,
+    class_dropout_prob=0.143,
     in_channels=1,
     learn_sigma=False,
     use_swiglu=True,
     # use_rope=True,
     # qk_norm=True, # when bf16 training
-    attn_type="vanilla",  # window, linear, vanilla
+    attn_type="vanilla",  # window, linear, vanilla, physics
+    slice_num=256,
     mlp_ratio=2.5,
 )
 
+# model = DiTCoordPE(
+#     coords=torch.tensor(coords, dtype=torch.float32),
+#     depth=6,
+#     hidden_size=128,
+#     patch_size=1,
+#     num_heads=4,
+#     input_size=train_cp.shape[2], # dataset grid size
+#     cond_dim=2, # number of parameters (alpha, mach)
+#     class_dropout_prob=0.2,
+#     in_channels=1,
+#     learn_sigma=False,
+#     use_swiglu=True,
+#     # use_rope=True,
+#     qk_norm=True, # when bf16 training
+#     attn_type="vanilla",  # window, linear, vanilla
+#     mlp_ratio=2.5,
+# )
+
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
+print("Number trainable of parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad))
+
 sampler = Sampler(transport=create_transport(
     # use_cosine_loss=True,
     # use_lognorm=True
@@ -151,19 +172,19 @@ diffusion = FlowMatching(
     model,
     input_size=train_cp.shape[2],
     cond_scale=2,
-    num_sampling_steps=400,
+    num_sampling_steps=100,
     sampling_method="euler",
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/tifon_new_split/dit_xxs_2'
-train_steps = 300000
+results_folder = 'results/tifon_new_split_ordered/should_be_the_best_vanilla_attn_p4'
+train_steps = 100000
 trainer = Trainer1D(
     diffusion,
-    dataset=train_dataset,
-    dataset_test=val_dataset, # small_val_dataset is to avoid timeout when training on 2 GPUs
+    dataset=train_dataset_merged,
+    dataset_test=test_dataset, # small_val_dataset is to avoid timeout when training on 2 GPUs
     train_batch_size=16,
-    train_lr=1e-4,
+    train_lr=0.00023944586926057682, #1e-4,
     train_num_steps=train_steps,  # total training steps
     gradient_accumulate_every=1,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
@@ -174,29 +195,20 @@ trainer = Trainer1D(
     eta_min_scheduler=4e-6,
     max_grad_norm=1.0,
     # use_cpu=True,
-    # use_muon=True,
+    use_muon=True,
     compile_model=True,
     split_batches=True
 )
-trainer.load(4)
+# trainer.load(5)
 trainer.train()
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
 
+samples, seqs = trainer.eval_model(test_dataset, batch_size=32, use_autocast=True)
+
 if trainer.accelerator.is_main_process:
-    # torch.cuda.empty_cache()  # Clear GPU memory
-    diffusion = trainer.accelerator.unwrap_model(diffusion, keep_torch_compile=True)
-    trainer.ema.ema_model.eval()  # Ensure eval mode
-    diffusion.eval()
+
     test_data, test_parameters = test_dataset.tensors
-    errors, samples = evaluate_model(
-        trainer.ema.ema_model, # trainer.ema.ema_model, # diffusion
-        test_parameters,
-        test_data,
-        32,
-        cond_scale=2
-    )
     samples = samples[:, :original_length]  # Remove padding if it was added
-    print(f"Final errors:\n{errors}")
     torch.save(samples, f"{results_folder}/test_predictions_ema.pt")
 
     from cetaceo.evaluators import RegressionEvaluator

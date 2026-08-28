@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.distributed.distributed_c10d import destroy_process_group
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance_1d import GaussianDiffusion1D, Trainer1D, Unet1D
@@ -10,6 +11,7 @@ import shutil
 import os
 import json
 from functools import partial
+import matplotlib.pyplot as plt
 
 
 train_ds, val_ds, test_ds, stats = build_datasets(
@@ -55,12 +57,11 @@ class ViTBlock(DiTBlock):
         return x
 
 class ViT(DiT):
-    def __init__(self, use_coord_pe=True, *args, **kwargs):
+    def __init__(self, use_coord_pe=True, coord_dim=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if use_coord_pe:
             self.use_coord_pe = use_coord_pe
-            # 3 IS HARDCODED HERE TOO, 3 for xyz. 1 for ordinal numbers (1, 2, 3, ...).
-            self.coord_pe = CoordEmbedder(kwargs["hidden_size"], coord_dim=1)
+            self.coord_pe = CoordEmbedder(kwargs["hidden_size"], coord_dim=coord_dim)
         # 1 is hardcoded, it is the output channels
         self.out_channels = 1
         self.final_layer = FinalLayerViT(kwargs["hidden_size"], self.patch_size, self.out_channels, bias=True)
@@ -87,10 +88,12 @@ class ViT(DiT):
         # pos_embed = self.pos_embed if not self.use_coord_pe else self.coord_pe(context.permute(0, 2, 1))
 
         x = self.x_embedder(context)  # (N, T, D), where T = H * W / patch_size ** 2
+
         pe_input = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
         # repeat pe_inpu to have batch dimension 
         pe_input = pe_input.expand(x.shape[0], -1).unsqueeze(2)
         pos_embed = self.pos_embed if not self.use_coord_pe else self.coord_pe(pe_input)  # (1, T, D)
+        
         x = x + pos_embed  # (N, T, D)
         force_drop_ids = kwargs.get("force_drop_ids", None)
         c = None
@@ -107,19 +110,21 @@ class ViT(DiT):
         loss = ((true_values - x) ** 2).mean()
         return loss
     
-    def sample(self, classes, context=None, mask=None, return_all_steps=False, **model_kwargs):
+    def sample(self, classes=None, context=None, mask=None, return_all_steps=False, **model_kwargs):
         self.eval()
         with torch.inference_mode():
             preds = self(None, classes=classes, context=context, mask=mask, return_loss=False, **model_kwargs)  # Run a forward pass to initialize any lazy modules
         return preds
 
-patch_size = 1
+patch_size = 8
 dataloader_collate_fn = partial(mesh_collate_fn, pad_multiple=patch_size)
 model = ViT(
+    coord_dim=1,
+    use_coord_pe=True, 
     depth=12,
-    hidden_size=384,
+    hidden_size=512,
     patch_size=patch_size,
-    num_heads=6,
+    num_heads=4,
     # input_size=data_sample[0].shape[2],
     # cond_dim=data_sample[1].shape[1],
     class_dropout_prob=0,
@@ -129,7 +134,7 @@ model = ViT(
     use_swiglu=True,
     # use_rope=True,
     qk_norm=True,
-    attn_type="linear",  # window, linear, vanilla
+    attn_type="vanilla",  # window, linear, vanilla
     # window_size=107,
     # num_experts=8,
     # num_experts_per_tok=2
@@ -139,13 +144,13 @@ print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print("Number trainable parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad))   
 
 
-results_folder = 'results/drivaernet/vit_first'
+results_folder = 'results/drivaernet/vit_8_first'
 train_steps = 300000
 trainer = Trainer1D(
     model,
     dataset=train_ds,
     # dataset_test=val_ds, # small_val_dataset is to avoid timeout when training on 2 GPUs
-    train_batch_size=1,
+    train_batch_size=256,
     train_lr=2e-4,
     num_samples=9,
     train_num_steps=train_steps,  # total training steps
@@ -159,13 +164,67 @@ trainer = Trainer1D(
     max_grad_norm=1.0,
     # use_cpu=True,
     # use_muon=True,
-    # compile_model=True,
+    compile_model=True,
     split_batches=True,
-    dataloader_collate_fn=dataloader_collate_fn
+    dataloader_collate_fn=dataloader_collate_fn,
+    # use_fsdp=True
 )
+
+def reconstruct_mask(dataset, padded_len: int) -> torch.BoolTensor:
+    """
+    Reconstructs the attention mask from the original unpadded dataset tensors.
+
+    Args:
+        dataset    : MeshDataset instance (must have .pressures list)
+        padded_len : the L dimension of your padded (n_samples, n_points) tensor
+
+    Returns:
+        mask : (n_samples, padded_len) bool — True = real point, False = padding
+    """
+    lengths = torch.tensor([p.shape[0] for p in dataset.pressures])  # (n_samples,)
+    mask = torch.arange(padded_len).unsqueeze(0) < lengths.unsqueeze(1)  # (n_samples, L)
+    return mask
 # with open(os.path.join(results_folder, 'norm_coefficients.json'), 'w') as f:
 #     json.dump(coefficients, f, indent=4)
-# trainer.load(2)
-trainer.train(do_profiling=False)
-shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
-samples, seqs = trainer.eval_model(test_ds, batch_size=32) # , cfg_interval_start=0.2
+r2_list = []
+for i in range(1, 5):
+    trainer.load(i)
+    # trainer.train(do_profiling=False)
+    # shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
+    samples, seqs = trainer.eval_model(test_ds, batch_size=64, use_autocast=True, pad_output=True) # , cfg_interval_start=0.2
+
+
+    if trainer.accelerator.is_main_process:
+        # samples = torch.load(f"{results_folder}/test_predictions_ema.pt", weights_only=True)
+        torch.save(samples, f"{results_folder}/test_predictions_ckp_{i}.pt")
+        from cetaceo.evaluators import RegressionEvaluator
+        mask = reconstruct_mask(test_ds, samples.shape[-1])  # (n_samples, L)
+        samples = samples.squeeze()[mask]
+        samples = (samples * stats["p_std"]) + stats["p_mean"]
+        test_data, test_parameters = test_ds[:]
+        print(type(test_data), "for checkpoint ", i)
+        test_data = torch.concatenate(test_data)
+        print(test_data.shape, samples.shape)
+        test_data = (test_data * stats["p_std"]) + stats["p_mean"]
+        evaluator = RegressionEvaluator()
+        metrics = evaluator(samples, test_data)
+        r2 = metrics["r2"]
+        evaluator.print_metrics()
+        # record r2
+            
+        r2_list.append((i, float(r2)))
+
+if trainer.accelerator.is_main_process:
+    r2_list.sort(key=lambda x: x[0])
+    steps, r2_vals = zip(*r2_list)
+    plt.figure()
+    plt.plot(steps, r2_vals, marker='o')
+    plt.xlabel('checkpoint')
+    plt.ylabel('R2')
+    plt.title('R2 evolution')
+    plt.grid(True)
+    os.makedirs(results_folder, exist_ok=True)
+    plt.savefig(os.path.join(results_folder, 'r2_evolution.png'))
+    plt.close()
+
+destroy_process_group()

@@ -58,12 +58,6 @@ X_test = X_test_conditions
 Y_train = Y_train_tot_conditions
 Y_test = Y_test_tot_conditions
 
-# reduce the number of geometric points
-# num_points_to_keep = 75000
-# selected_indices = np.random.choice(nwallp, num_points_to_keep, replace=False)
-# Y_train = Y_train[:, selected_indices, :]
-# Y_test = Y_test[:, selected_indices, :]
-
 # process with torch 
 # first, move channels dim
 Y_train = torch.tensor(Y_train, dtype=torch.float32).permute(0, 2, 1)
@@ -85,6 +79,7 @@ original_length = Y_train.shape[2]
 pad_length = 260864
 Y_train = F.pad(Y_train, (0, pad_length - nwallp))
 Y_test = F.pad(Y_test, (0, pad_length - nwallp))
+coords = F.pad(torch.from_numpy(coords).float(), (0, 0, 0, pad_length - nwallp))
 
 print("X train shape", X_train.shape)
 print("X test shape", X_test.shape)
@@ -137,14 +132,14 @@ def mesh_subsample_collate_fn(batch, num_points, coords):
     # None is returned indicating mask is None to keep consistency with the other collate_fn
     return pressures, conditions, coords, None
 
-num_subsampling_points = 15000
-
+num_subsampling_points = pad_length
+patch_size = 8
 model = ViT(
-    use_coord_pe=True,
+    use_coord_pe=False,
     coord_dim=3, # xyz
-    depth=6,
-    hidden_size=128,
-    patch_size=1,
+    depth=8,
+    hidden_size=256,
+    patch_size=patch_size,
     num_heads=4,
     input_size=num_subsampling_points, # seq_length, not important for vit
     cond_dim=3, # mach, aoa, p_i
@@ -156,7 +151,7 @@ model = ViT(
     use_swiglu=True,
     # use_rope=True,
     qk_norm=True,
-    attn_type="vanilla",  # window, linear, vanilla
+    attn_type="linear",  # window, linear, vanilla
     # window_size=107,
     # num_experts=8,
     # num_experts_per_tok=2
@@ -166,15 +161,15 @@ model = ViT(
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print("Number of learneable parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
-results_folder = 'results/onera/vit_first'
+results_folder = 'results/onera/vit_gradients_test'
 
-train_steps = 500000
+train_steps = 100000
 
 trainer = Trainer1D(
     model,
     dataset=dataset_train,
     # dataset_test=dataset_test,
-    train_batch_size=32,
+    train_batch_size=16,
     train_lr=2e-4,
     num_samples=9,
     train_num_steps=train_steps+4,  # total training steps
@@ -183,14 +178,14 @@ trainer = Trainer1D(
     amp = True,                       # turn on mixed precision
     mixed_precision_type='bf16',
     results_folder=results_folder,  # folder to save results to
-    save_and_sample_every=20000,
+    save_and_sample_every=10000,
     eta_min_scheduler=1e-6,
     max_grad_norm=1.0,
     # use_cpu=True,
     # use_muon=True,
     compile_model=True, 
     split_batches=True,
-    dataloader_collate_fn=partial(mesh_subsample_collate_fn, num_points=num_subsampling_points, coords=torch.from_numpy(coords))
+    dataloader_collate_fn=partial(mesh_subsample_collate_fn, num_points=num_subsampling_points, coords=coords)
 )
 
 # trainer.load(20)

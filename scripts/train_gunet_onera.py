@@ -6,6 +6,7 @@ import json
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -20,53 +21,26 @@ from denoising_diffusion_pytorch.graph_unet_cfg_diffusion import (
     GraphDiffusion,
     Trainer,
 )
-import pyLOM
 from cetaceo.evaluators import RegressionEvaluator
 
-
-data_dir = "/home/d.ramos/Datos_DLR_pylom"
-
-def load_dataset(name, norm_coefficients):
-    data_train = pyLOM.Dataset.load(f"{data_dir}/{name}.h5")
-    airfoil_coords = torch.tensor(data_train.xyz).float()
-    aoa = data_train.get_variable('AoA')
-    mach = data_train.get_variable('Mach')
-    cp = data_train["CP"].T
-    if "cp_min" not in norm_coefficients:
-        norm_coefficients["cp_min"] = cp.min()
-        norm_coefficients["cp_max"] = cp.max()
-    cp = (cp - norm_coefficients["cp_min"]) / (norm_coefficients["cp_max"] - norm_coefficients["cp_min"])
-
-    if "mach_mean" not in norm_coefficients:
-        norm_coefficients["mach_mean"] = mach.mean()
-        norm_coefficients["mach_std"] = mach.std()
-    mach = (mach - norm_coefficients["mach_mean"]) / norm_coefficients["mach_std"]
-
-    if "aoa_mean" not in norm_coefficients:
-        norm_coefficients["aoa_mean"] = aoa.mean()
-        norm_coefficients["aoa_std"] = aoa.std()
-    aoa = (aoa - norm_coefficients["aoa_mean"]) / norm_coefficients["aoa_std"]
-
-    cp_t = torch.from_numpy(cp).float()
-    aoa_t = torch.from_numpy(aoa).float()
-    mach_t = torch.from_numpy(mach).float()
-    print(cp.min(), cp.max())
-    print(aoa.mean(), aoa.std())
-    print(mach.mean(), mach.std())
-
-    return TensorDataset(cp_t, aoa_t, mach_t), airfoil_coords
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+np.random.seed(42)
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True  
 
 def collate_fn(batch, mesh_coords, edge_index):
     graphs = [
         Data(
             x=torch.cat(
-                [mesh_coords, torch.full_like(mesh_coords[:, 0:1], mach.item()), torch.full_like(mesh_coords[:, 0:1], aoa.item())], dim=1,
+                [mesh_coords, torch.full_like(mesh_coords[:, 0:1], mach.item()), torch.full_like(mesh_coords[:, 0:1], aoa.item()), torch.full_like(mesh_coords[:, 0:1], p_i.item())], dim=1,
             ),
             pos=mesh_coords,
             y=cp,
             edge_index=edge_index.clone(),
         )
-        for cp, aoa, mach in batch
+        for cp, aoa, mach, p_i in batch
     ]
     return Batch.from_data_list(graphs)
     # batched = Batch.from_data_list(graphs)
@@ -74,36 +48,113 @@ def collate_fn(batch, mesh_coords, edge_index):
     # batched.edge_index = knn_graph(batched.pos, k=2, batch=batched.batch, loop=False)
     # return batched
 
-norm_coefficients = {}
+qoi_list = ['cp', 'cfx', 'cfy', 'cfz'] # names of the quantites of interest
+nwallp = 260774  # number of points on the aircraft skin
 
-dataset_train, airfoil_coords = load_dataset("NRL7301_TRAIN", norm_coefficients)
-print(airfoil_coords.min(axis=0), airfoil_coords.max(axis=0))
+data_dir = "/home/airbus/onera_data"
+X_train_tot = np.load(data_dir + '/X_train.npy')
+Y_train_tot = np.load(data_dir + '/Ytrain.npy')
+X_test = np.load(data_dir + '/X_test.npy')
+Y_test = np.load(data_dir + '/Ytest.npy')
+
+df_description = pd.read_csv(data_dir + '/describe_train_test_repartition_with_weights.csv', index_col=0)
+df_test = df_description.loc[~df_description['Train']]
+df_train = df_description.loc[df_description['Train']]
+
+ncase = len(df_description)  # 468
+ntest = len(df_test) # 156
+ntrain = ncase-ntest  # 312
+
+# extract xyz coordinates 
+airfoil_coords = torch.tensor(X_train_tot[0:nwallp,:3], dtype=torch.float32)
+
+airfoil_coords_mean = airfoil_coords.mean(dim=0, keepdim=True)
+airfoil_coords_std = airfoil_coords.std(dim=0, keepdim=True)
+airfoil_coords = (airfoil_coords - airfoil_coords_mean) / airfoil_coords_std
+
+# Remove the geometric informations from the input array
+X_train_tot_conditions = X_train_tot[0::nwallp,6:9]
+X_test_conditions = X_test[0::nwallp,6:9]
+# Create the output array to be of shape (ntrain, nwallp, 4)
+Y_train_tot_conditions = np.array([Y_train_tot[nwallp*i:nwallp*(i+1),:] for i in range(ntrain)])
+Y_test_tot_conditions = np.array([Y_test[nwallp*i:nwallp*(i+1),:] for i in range(ntest)])
+
+print("X_train_tot_conditions shape", X_train_tot_conditions.shape)
+print("Y_train_tot_conditions shape", Y_train_tot_conditions.shape)
+# split X_train_tot and Y_train_tot into train and validation arrays
+X_train = X_train_tot_conditions
+X_test = X_test_conditions
+
+Y_train = Y_train_tot_conditions
+Y_test = Y_test_tot_conditions
+
+# process with torch 
+# first, move channels dim
+Y_train = torch.tensor(Y_train, dtype=torch.float32).permute(0, 2, 1)
+Y_test = torch.tensor(Y_test, dtype=torch.float32).permute(0, 2, 1)
+
+# normalize/standarize things
+train_mean = Y_train.mean(dim=(0, 2), keepdim=True)
+train_std  = Y_train.std(dim=(0, 2), keepdim=True)
+condition_mean = X_train.mean(axis=0, keepdims=True)
+condition_std = X_train.std(axis=0, keepdims=True) 
+
+Y_train = (Y_train - train_mean) / train_std
+Y_test = (Y_test - train_mean) / train_std
+X_train = (X_train - condition_mean) / condition_std
+X_test = (X_test - condition_mean) / condition_std
+
+# pad sequences to a multple of a power of 2. 260864 = 256 * 1019
+original_length = Y_train.shape[2]
+# pad_length = 260864
+# Y_train = F.pad(Y_train, (0, pad_length - nwallp))
+# Y_test = F.pad(Y_test, (0, pad_length - nwallp))
+
+print("X train shape", X_train.shape)
+print("X test shape", X_test.shape)
+print("Y train shape", Y_train.shape)
+print("Y test shape", Y_test.shape)
+print("mean/std X train test ", X_train.mean(axis=0), X_test.mean(axis=0), X_train.std(axis=0), X_test.std(axis=0))
+print("mean/std Y train test ", Y_train.mean(dim=(0, 2)), Y_test.mean(dim=(0, 2)), Y_train.std(dim=(0, 2)), Y_test.std(dim=(0, 2)))
+dataset_train = TensorDataset(
+    Y_train, torch.tensor(X_train[:, 0:1], dtype=torch.float32), torch.tensor(X_train[:, 1:2], dtype=torch.float32), torch.tensor(X_train[:, 2:], dtype=torch.float32)
+)
+
+dataset_test = TensorDataset(
+    Y_test, torch.tensor(X_test[:, 0:1], dtype=torch.float32), torch.tensor(X_test[:, 1:2], dtype=torch.float32), torch.tensor(X_test[:, 2:], dtype=torch.float32)
+)
+
+norm_coefficients = {
+    "cp_mean": train_mean.squeeze().cpu().numpy(),
+    "cp_std": train_std.squeeze().cpu().numpy(),
+    "condition_mean": condition_mean.squeeze(),
+    "condition_std": condition_std.squeeze(),
+}
 num_points = airfoil_coords.shape[0]
-# compute the connectivity
-# edge_index = knn_graph(airfoil_coords, k=2, batch=None, loop=False)
-dataset_test, _ = load_dataset("NRL7301_TEST", norm_coefficients)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+out_channels = 4
 model = ConditionedGraphUNet(
     dim=128,
-    in_channels=4,
-    out_channels=1,
+    in_channels=6, # xyz, aoa, m, pi
+    out_channels=out_channels,
     # cond_dim=2,
     cond_drop_prob=0.0,
+    attention_layers=[1, 2],
     dim_mults=(1, 2, 4),
     pool_ratios=0.5,
     sum_res=True,
     act=torch.nn.GELU(),
     attn_heads=8,
-    attn_dim_head=64
+    attn_dim_head=32
 )
 model.to(device)
-
-results_dir = Path("results/dlr/solo_gunet_NOSE_with_attn_scheduler")
+# model = torch.compile(model)
+results_dir = Path("results/onera/solo_gunet_NOSE_with_attn_sum_res_scheduler")
 os.makedirs(results_dir, exist_ok=True)
 
-training_iters = 60000
-batch_size = 4
+training_iters = 30000
+batch_size = 1
 lr = 1e-4
 
 def cycle(dl):
@@ -113,13 +164,13 @@ def cycle(dl):
 
 def eval_model(model, dl_test):
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         preds_list = []
         targets_list = []
         for data in dl_test:
             inputs, edge_index, targets = data.x.to(device), data.edge_index.to(device), data.y.to(device)
             inputs = rearrange(inputs, "(b n) c -> b c n", n=num_points)
-            targets = rearrange(targets, "(b n) -> b n", n=num_points)
+            targets = rearrange(targets, "(b c) n -> b c n", c=out_channels)
             outputs = model(inputs, edge_index)  # (b, c, n)
             outputs = outputs.squeeze(1)  # (b, n)
             preds_list.append(outputs.detach().cpu().numpy())
@@ -131,13 +182,14 @@ def eval_model(model, dl_test):
         targets_np = np.concatenate(targets_list, axis=0)
         # print("predictions shape:", predictions_np.shape, "targets shape:", targets_np.shape)
     model.train()
+    # save model and optimizer state dicts as ckeckpoints
     # unscale predictions and targets
-    predictions_np = (predictions_np * (norm_coefficients["cp_max"] - norm_coefficients["cp_min"])) + norm_coefficients["cp_min"]
-    targets_np = (targets_np * (norm_coefficients["cp_max"] - norm_coefficients["cp_min"])) + norm_coefficients["cp_min"]
+    predictions_np = predictions_np * norm_coefficients["cp_std"][None, :, None] + norm_coefficients["cp_mean"][None, :, None]
+    targets_np = targets_np * norm_coefficients["cp_std"][None, :, None] + norm_coefficients["cp_mean"][None, :, None]
     return predictions_np, targets_np
 
 if __name__ == "__main__":
-    edge_index = knn_graph(airfoil_coords, k=2, batch=None, loop=False)
+    edge_index = knn_graph(airfoil_coords, k=6, batch=None, loop=False)
     dl = DataLoader(dataset_train, batch_size=batch_size, collate_fn=partial(collate_fn, mesh_coords=airfoil_coords, edge_index=edge_index))
     dl_test = DataLoader(dataset_test, batch_size=batch_size, collate_fn=partial(collate_fn, mesh_coords=airfoil_coords, edge_index=edge_index))
     dl = cycle(dl)
@@ -148,17 +200,17 @@ if __name__ == "__main__":
     optimizer = AdamW(model.parameters(), lr=lr, betas=(0.9, 0.99), weight_decay=1e-4, fused=True)
     # cosine annealing lr scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_iters, eta_min=1e-6)
- 
+
     steps = 0
     all_losses = []
     test_losses = []
-    eval_test_every = 500
+    eval_test_every = 5000
     with tqdm(total=training_iters) as pbar:
         while steps < training_iters:
             data = next(dl)
             inputs, edge_index, targets = data.x.to(device), data.edge_index.to(device), data.y.to(device)
             inputs = rearrange(inputs, "(b n) c -> b c n", n=num_points)
-            targets = rearrange(targets, "(b n) -> b n", n=num_points)
+            targets = rearrange(targets, "(b c) n -> b c n", c=out_channels)
             # print(f"edge_index max: {edge_index.max()}, expected max: {inputs.shape[0] * inputs.shape[2] - 1}")
             # print(f"Batch: inputs shape: {inputs.shape}, edge_index shape: {edge_index.shape}")
             preds = model(inputs, edge_index)
@@ -179,11 +231,11 @@ if __name__ == "__main__":
                 predictions_np, targets_np = eval_model(model, dl_test)
                 test_loss = ((predictions_np - targets_np) ** 2).mean()
                 test_losses.append(test_loss)
+                torch.save(model.state_dict(), results_dir / "gunet_state_dict_ckp.pt")
+                torch.save(optimizer.state_dict(), results_dir / "optimizer_state_dict_ckp.pt")
  
     # torch.cuda.empty_cache() 
-    # WARN: ESTOY CARGANDO EL MODELOS
     # model.load_state_dict(torch.load(results_dir / "gunet_state_dict.pt", map_location=device))
-    predictions_np, targets_np = eval_model(model, dl_test)
 
     evaluator = RegressionEvaluator(tolerance=1e-5)
     metrics = evaluator(targets_np, predictions_np)
@@ -208,8 +260,9 @@ if __name__ == "__main__":
     np.savez_compressed(results_dir / "predictions.npz", predictions=predictions_np, targets=targets_np)
     # save model state dict and full model
     torch.save(model.state_dict(), results_dir / "gunet_state_dict.pt")
-    # load the model
-    # model.load_state_dict(torch.load(results_dir / "gunet_state_dict.pt", map_location=device))
+    # save the optimizer too to resume training later
+    torch.save(optimizer.state_dict(), results_dir / "optimizer_state_dict.pt")
+
     # make sure values are JSON-serializable (convert numpy types to native Python floats)
     def to_serializable(obj):
         if isinstance(obj, dict):

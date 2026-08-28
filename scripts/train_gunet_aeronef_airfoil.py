@@ -20,41 +20,49 @@ from denoising_diffusion_pytorch.graph_unet_cfg_diffusion import (
     GraphDiffusion,
     Trainer,
 )
-import pyLOM
 from cetaceo.evaluators import RegressionEvaluator
 
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+np.random.seed(42)
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True  
 
-data_dir = "/home/d.ramos/Datos_DLR_pylom"
+def get_split_indices(split_name, split_data, all_conds, atol=1e-4, rtol=1e-12):
+    data = split_data[split_name]
+    indices = []
 
-def load_dataset(name, norm_coefficients):
-    data_train = pyLOM.Dataset.load(f"{data_dir}/{name}.h5")
-    airfoil_coords = torch.tensor(data_train.xyz).float()
-    aoa = data_train.get_variable('AoA')
-    mach = data_train.get_variable('Mach')
-    cp = data_train["CP"].T
-    if "cp_min" not in norm_coefficients:
-        norm_coefficients["cp_min"] = cp.min()
-        norm_coefficients["cp_max"] = cp.max()
-    cp = (cp - norm_coefficients["cp_min"]) / (norm_coefficients["cp_max"] - norm_coefficients["cp_min"])
+    for row in data:
+        # Compare this row against all rows in all_conds
+        matches = np.all(np.isclose(all_conds, row, atol=atol, rtol=rtol), axis=1)
+        found = np.where(matches)[0]
 
-    if "mach_mean" not in norm_coefficients:
-        norm_coefficients["mach_mean"] = mach.mean()
-        norm_coefficients["mach_std"] = mach.std()
-    mach = (mach - norm_coefficients["mach_mean"]) / norm_coefficients["mach_std"]
+        if len(found) == 0:
+            raise KeyError(f"No match found within tolerance for {row}")
+        if len(found) > 1:
+            raise ValueError(f"Multiple matches found within tolerance for {row}")
 
-    if "aoa_mean" not in norm_coefficients:
-        norm_coefficients["aoa_mean"] = aoa.mean()
-        norm_coefficients["aoa_std"] = aoa.std()
-    aoa = (aoa - norm_coefficients["aoa_mean"]) / norm_coefficients["aoa_std"]
+        indices.append(found[0])
 
-    cp_t = torch.from_numpy(cp).float()
-    aoa_t = torch.from_numpy(aoa).float()
-    mach_t = torch.from_numpy(mach).float()
-    print(cp.min(), cp.max())
-    print(aoa.mean(), aoa.std())
-    print(mach.mean(), mach.std())
+    return indices
 
-    return TensorDataset(cp_t, aoa_t, mach_t), airfoil_coords
+def sanity_check_splits(split_data, all_conds):
+    train_idx = set(get_split_indices("Train", split_data, all_conds=all_conds))
+    val_idx   = set(get_split_indices("Validation", split_data, all_conds=all_conds))
+    test_idx  = set(get_split_indices("Test", split_data, all_conds=all_conds))
+
+    # Check pairwise disjointness
+    assert train_idx.isdisjoint(val_idx),  "Train and Validation overlap!"
+    assert train_idx.isdisjoint(test_idx), "Train and Test overlap!"
+    assert val_idx.isdisjoint(test_idx),   "Validation and Test overlap!"
+
+    # Optional: check coverage
+    all_idx = train_idx | val_idx | test_idx
+    assert len(all_idx) == len(split_data["All"]), \
+        "Splits do not cover all samples exactly once"
+
+    print("✅ Sanity check passed: splits are disjoint and complete.")
 
 def collate_fn(batch, mesh_coords, edge_index):
     graphs = [
@@ -74,14 +82,76 @@ def collate_fn(batch, mesh_coords, edge_index):
     # batched.edge_index = knn_graph(batched.pos, k=2, batch=batched.batch, loop=False)
     # return batched
 
-norm_coefficients = {}
+data = np.load("data/aeronef/db_random.npy", allow_pickle=True).item()
+field_name_to_predict = "Cp" # "Pressure", Cp
+# cp = data["Cp"]
+# train_size = 0.8
+# training_indices = np.random.choice(cp.shape[0], int(cp.shape[0] * train_size), replace=False)
+# test_indices = np.setdiff1d(np.arange(cp.shape[0]), training_indices)
+split_data = np.load("data/aeronef/best_train-val-test_split.npy", allow_pickle=True).item()
+alpha, vel_inf = data["Alpha"], data["Vinf"]
+all_conds = np.stack((alpha, vel_inf), axis=1)
+training_indices = get_split_indices("Train", split_data, all_conds=all_conds)
+val_indices = get_split_indices("Validation", split_data, all_conds=all_conds)
+test_indices = get_split_indices("Test", split_data, all_conds=all_conds)
+sanity_check_splits(split_data, all_conds=all_conds)
+# import sys;sys.exit()
 
-dataset_train, airfoil_coords = load_dataset("NRL7301_TRAIN", norm_coefficients)
-print(airfoil_coords.min(axis=0), airfoil_coords.max(axis=0))
+def load_dataset(indices, norm_coefficients, data):
+    aoa = data["Alpha"][indices]
+    vinf = data["Vinf"][indices]
+    cp = data[field_name_to_predict][indices]
+    # if "cp_min" not in norm_coefficients:
+    #     norm_coefficients["cp_min"] = cp.min()
+    #     norm_coefficients["cp_max"] = cp.max()
+    # cp = (cp - norm_coefficients["cp_min"]) / (norm_coefficients["cp_max"] - norm_coefficients["cp_min"])
+    # feature_range = [-1, 1]
+    # cp = cp * (feature_range[1] - feature_range[0]) + feature_range[0]
+    # norm_coefficients["feature_range"] = feature_range
+    if "cp_mean" not in norm_coefficients:
+        norm_coefficients["cp_mean"] = cp.mean()
+        norm_coefficients["cp_std"] = cp.std()
+    cp = (cp - norm_coefficients["cp_mean"]) / norm_coefficients["cp_std"]
+
+    if "vinf_mean" not in norm_coefficients:
+        norm_coefficients["vinf_mean"] = vinf.mean()
+        norm_coefficients["vinf_std"] = vinf.std()
+    vinf = (vinf - norm_coefficients["vinf_mean"]) / norm_coefficients["vinf_std"]
+
+    if "aoa_mean" not in norm_coefficients:
+        norm_coefficients["aoa_mean"] = aoa.mean()
+        norm_coefficients["aoa_std"] = aoa.std()
+    aoa = (aoa - norm_coefficients["aoa_mean"]) / norm_coefficients["aoa_std"]
+
+    # pad/truncate to length 27500
+    # target_len = 27500 # 704 = 64*11 | 27499 = 257*107
+    # if field_name_to_predict == "Pressure" and cp.shape[1] < target_len:
+    #     pad_width = target_len - cp.shape[1]
+    #     cp = np.pad(cp, ((0, 0), (0, pad_width)), mode='constant', constant_values=0)
+    # pad_width = 696 - cp.shape[1]
+    # cp = np.pad(cp, ((0, 0), (0, pad_width)), mode='constant', constant_values=0)
+    cp_t = torch.from_numpy(cp).float()
+    # cp_t = cp_t[..., :-1]
+    aoa_t = torch.from_numpy(aoa).float()
+    mach_t = torch.from_numpy(vinf).float()
+    conditions = torch.stack([aoa_t, mach_t], dim=1)
+    print(cp.mean(), cp.std())
+    print(aoa.mean(), aoa.std())
+    print(vinf.mean(), vinf.std())
+    print(cp_t.shape, conditions.shape)
+
+    return TensorDataset(cp_t, aoa_t, mach_t)
+
+norm_coefficients = {}
+dataset_train = load_dataset(training_indices, norm_coefficients, data)
+val_dataset = load_dataset(val_indices, norm_coefficients, data)
+dataset_test = load_dataset(test_indices, norm_coefficients, data)
+airfoil_coords = torch.tensor(data["Airfoil"]).float()
+airfoil_coords_mean = airfoil_coords.mean(axis=0, keepdims=True)
+airfoil_coords_std = airfoil_coords.std(axis=0, keepdims=True)
+airfoil_coords = (airfoil_coords - airfoil_coords_mean) / airfoil_coords_std
+
 num_points = airfoil_coords.shape[0]
-# compute the connectivity
-# edge_index = knn_graph(airfoil_coords, k=2, batch=None, loop=False)
-dataset_test, _ = load_dataset("NRL7301_TEST", norm_coefficients)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = ConditionedGraphUNet(
@@ -91,6 +161,7 @@ model = ConditionedGraphUNet(
     # cond_dim=2,
     cond_drop_prob=0.0,
     dim_mults=(1, 2, 4),
+    attention_layers=[],
     pool_ratios=0.5,
     sum_res=True,
     act=torch.nn.GELU(),
@@ -98,12 +169,12 @@ model = ConditionedGraphUNet(
     attn_dim_head=64
 )
 model.to(device)
-
-results_dir = Path("results/dlr/solo_gunet_NOSE_with_attn_scheduler")
+# model = torch.compile(model)
+results_dir = Path("results/aeronef_cp_good_split/solo_gunet_NOSE_WITHOUT_attn_sum_res_scale_coords_w_scheduler")
 os.makedirs(results_dir, exist_ok=True)
 
 training_iters = 60000
-batch_size = 4
+batch_size = 32
 lr = 1e-4
 
 def cycle(dl):
@@ -132,8 +203,8 @@ def eval_model(model, dl_test):
         # print("predictions shape:", predictions_np.shape, "targets shape:", targets_np.shape)
     model.train()
     # unscale predictions and targets
-    predictions_np = (predictions_np * (norm_coefficients["cp_max"] - norm_coefficients["cp_min"])) + norm_coefficients["cp_min"]
-    targets_np = (targets_np * (norm_coefficients["cp_max"] - norm_coefficients["cp_min"])) + norm_coefficients["cp_min"]
+    predictions_np = predictions_np * norm_coefficients["cp_std"] + norm_coefficients["cp_mean"]
+    targets_np = targets_np * norm_coefficients["cp_std"] + norm_coefficients["cp_mean"]
     return predictions_np, targets_np
 
 if __name__ == "__main__":
@@ -148,7 +219,7 @@ if __name__ == "__main__":
     optimizer = AdamW(model.parameters(), lr=lr, betas=(0.9, 0.99), weight_decay=1e-4, fused=True)
     # cosine annealing lr scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_iters, eta_min=1e-6)
- 
+
     steps = 0
     all_losses = []
     test_losses = []
@@ -181,9 +252,7 @@ if __name__ == "__main__":
                 test_losses.append(test_loss)
  
     # torch.cuda.empty_cache() 
-    # WARN: ESTOY CARGANDO EL MODELOS
     # model.load_state_dict(torch.load(results_dir / "gunet_state_dict.pt", map_location=device))
-    predictions_np, targets_np = eval_model(model, dl_test)
 
     evaluator = RegressionEvaluator(tolerance=1e-5)
     metrics = evaluator(targets_np, predictions_np)
@@ -208,8 +277,7 @@ if __name__ == "__main__":
     np.savez_compressed(results_dir / "predictions.npz", predictions=predictions_np, targets=targets_np)
     # save model state dict and full model
     torch.save(model.state_dict(), results_dir / "gunet_state_dict.pt")
-    # load the model
-    # model.load_state_dict(torch.load(results_dir / "gunet_state_dict.pt", map_location=device))
+
     # make sure values are JSON-serializable (convert numpy types to native Python floats)
     def to_serializable(obj):
         if isinstance(obj, dict):

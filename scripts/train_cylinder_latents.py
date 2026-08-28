@@ -86,11 +86,11 @@ dataset_test = TensorDataset(
 )  
 
 model = DiT(
-    depth=6,
-    hidden_size=128,
+    depth=12,
+    hidden_size=1280,
     patch_size=1,
     num_frames=fields_train.shape[1],
-    num_heads=4,
+    num_heads=20,
     input_size=latents_train.shape[-1], # dataset grid size
     cond_dim=1, # number of parameters (Re)
     class_dropout_prob=0.2,
@@ -99,9 +99,9 @@ model = DiT(
     use_swiglu=True,
     # use_rope=True,
     qk_norm=True, # when bf16 training
-    attn_type="vanilla",  # window, linear, vanilla, physics
-    mlp_ratio=2.5,
-    factorize=False,
+    attn_type="linear",  # window, linear, vanilla, physics
+    mlp_ratio=3,
+    factorize=True,
 )
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 
@@ -120,7 +120,7 @@ diffusion = FlowMatching(
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/cylinder_nvidia/ldm_depth_6_p1_hid128_factorized'
+results_folder = 'results/cylinder_nvidia/ldm_depth_12_p1_hid1280_linear_factorize'
 
 train_steps = 100000
 
@@ -128,10 +128,10 @@ trainer = Trainer1D(
     diffusion,
     dataset=dataset_train,
     dataset_test=dataset_test, # small_val_dataset is to avoid timeout when training on 2 GPUs
-    train_batch_size=8,
+    train_batch_size=2,
     train_lr=1e-4,
     train_num_steps=train_steps,  # total training steps
-    gradient_accumulate_every=1,  # gradient accumulation steps
+    gradient_accumulate_every=4,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
     amp=True,     # turn on mixed precision
     mixed_precision_type='bf16',
