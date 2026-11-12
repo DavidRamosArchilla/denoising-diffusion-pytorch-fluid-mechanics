@@ -8,6 +8,7 @@ from denoising_diffusion_pytorch.continuous_classifier_free_guidance_1d import G
 from denoising_diffusion_pytorch.continuous_classifier_free_guidance import evaluate_model
 from denoising_diffusion_pytorch.dit import DiT_models, DiTCoordPE, DiT
 from denoising_diffusion_pytorch.transport import create_transport, Sampler, FlowMatching
+from denoising_diffusion_pytorch.dit_graph import GraphDiT
 
 import torch
 from torch.utils.data import TensorDataset, ConcatDataset
@@ -24,8 +25,13 @@ import matplotlib.pyplot as plt
 #     "font.size": 12
 # })
 
-def get_split_indices(split_name, split_data, all_conds, atol=1e-4, rtol=1e-12):
-    data = split_data[split_name]
+def get_split_indices(split_name, split_data, all_conds, subsplits=[],atol=1e-4, rtol=1e-12):
+    if len(subsplits) > 0:
+        data = []
+        for subsplit_name in subsplits:
+            data += split_data[split_name][subsplit_name]
+    else:
+        data = split_data[split_name]
     indices = []
 
     for row in data:
@@ -42,9 +48,9 @@ def get_split_indices(split_name, split_data, all_conds, atol=1e-4, rtol=1e-12):
 
     return indices
 
-def sanity_check_splits(split_data, all_conds):
-    train_idx = set(get_split_indices("train", split_data, all_conds=all_conds))
-    val_idx   = set(get_split_indices("validation", split_data, all_conds=all_conds))
+def sanity_check_splits(split_data, all_conds, subsplits=[]):
+    train_idx = set(get_split_indices("train", split_data, all_conds=all_conds, subsplits=subsplits))
+    val_idx   = set(get_split_indices("validation", split_data, all_conds=all_conds, subsplits=subsplits))
     test_idx  = set(get_split_indices("test", split_data, all_conds=all_conds))
 
     # Check pairwise disjointness
@@ -62,22 +68,24 @@ def sanity_check_splits(split_data, all_conds):
 DATA_DIR  = Path("/home/airbus/CETACEO_cp_interp/DATA/TIFON")
 
 # data = pyLOM.Dataset.load(DATA_DIR / "CADGroup_3_completo_stage_1.h5")
-data = pyLOM.Dataset.load("/home/airbus/CETACEO_cp_interp/CLUSTERING_TIFON/AIRBUS/database/CADGroup_3_completo_stage_1_reordered.h5")
-coords = data.xyz[:, [0, 2]]
+# data = pyLOM.Dataset.load("/home/airbus/CETACEO_cp_interp/CLUSTERING_TIFON/AIRBUS/database/CADGroup_3_completo_stage_1_reordered.h5")
+data = pyLOM.Dataset.load("/home/airbus/CETACEO_cp_interp/DATA/TIFON/rans5/outputs/CADGroup_3_stage_1_reordered.h5")
+mesh_coords = data.xyz[:, [0, 2]]
 cp = data["BoundaryValues_CoefPressure"].T
 cp = cp[:, np.newaxis, :]
-alpha, mach = torch.tensor(data.get_variable('aoa')).float(), torch.tensor(data.get_variable('M')).float()
+alpha, mach = torch.tensor(data.get_variable('aoa')).float(), torch.tensor(data.get_variable('mach')).float()
 print(f"Loaded data: cp shape {cp.shape}, alpha shape {alpha.shape}, mach shape {mach.shape}")
 
 # split_data = np.load(DATA_DIR / 'best_train-val-test_split.npy', allow_pickle=True).item()
-with open(DATA_DIR / "tifon_split_complete.json") as f:
+# with open(DATA_DIR / "tifon_split_complete.json") as f:
+with open(DATA_DIR / "/home/airbus/CETACEO_cp_interp/TIFON/splitting/tifon_split_complete.json") as f:
     split_data = json.load(f)
 
 all_conds = torch.stack((alpha, mach), dim=1).numpy()
-train_indices = get_split_indices("train", split_data, all_conds)
-val_indices = get_split_indices("validation", split_data, all_conds)
+train_indices = get_split_indices("train", split_data, all_conds, ["batch0", "batch1", "batch2"])
+val_indices = get_split_indices("validation", split_data, all_conds, ["batch0", "batch1", "batch2"])
 test_indices = get_split_indices("test", split_data, all_conds)
-sanity_check_splits(split_data, all_conds)
+sanity_check_splits(split_data, all_conds, ["batch0", "batch1", "batch2"])
 
 train_cp, train_conds = cp[train_indices], all_conds[train_indices]
 val_cp, val_conds = cp[val_indices], all_conds[val_indices]
@@ -102,6 +110,15 @@ val_conds = (val_conds - conds_mean) / conds_std
 test_conds = (test_conds - conds_mean) / conds_std
 print(f"After normalization, condition means: {train_conds.mean(axis=0)}, stds: {train_conds.std(axis=0)}")
 
+coefficients = {
+    "cp_mean": float(cp_mean),
+    "cp_std": float(cp_std),
+    "conds_mean": conds_mean.tolist(),
+    "conds_std": conds_std.tolist(),
+    "original_length": int(original_length),
+    "pad_length": int(pad_length),
+}
+
 train_dataset = TensorDataset(torch.tensor(train_cp).float(), torch.tensor(train_conds).float())
 val_dataset = TensorDataset(torch.tensor(val_cp).float(), torch.tensor(val_conds).float())
 test_dataset = TensorDataset(torch.tensor(test_cp).float(), torch.tensor(test_conds).float())
@@ -124,22 +141,41 @@ train_dataset_merged = ConcatDataset([train_dataset, val_dataset])
 # )
 
 model = DiT(
-    depth=7,
-    hidden_size=512,
-    patch_size=4,
-    num_heads=16,
+    depth=4,
+    hidden_size=256,
+    patch_size=8,
+    num_heads=8,
     input_size=train_cp.shape[2], # dataset grid size
     cond_dim=2, # number of parameters (alpha, mach)
-    class_dropout_prob=0.143,
+    class_dropout_prob=0.167,
     in_channels=1,
     learn_sigma=False,
     use_swiglu=True,
     # use_rope=True,
     # qk_norm=True, # when bf16 training
     attn_type="vanilla",  # window, linear, vanilla, physics
-    slice_num=256,
-    mlp_ratio=2.5,
+    # slice_num=64,
+    mlp_ratio=4,
 )
+
+# model = GraphDiT(
+#     mesh_pos=mesh_coords,
+#     cond_dim=2,
+#     class_dropout_prob=0.19,
+#     in_channels=1,
+#     learn_sigma=False,
+#     hidden_size=512,
+#     depth=7,
+#     num_heads=8,
+#     mlp_ratio=3.73,
+#     learnable_slices=True,
+#     num_patches=64,
+#     static_prior=2.76,
+#     temperature=0.2,
+#     patch_knn=8,
+#     reinject_pos=True,  
+#     attn_type="vanilla",
+# )
 
 # model = DiTCoordPE(
 #     coords=torch.tensor(coords, dtype=torch.float32),
@@ -177,14 +213,18 @@ diffusion = FlowMatching(
     # shifted_mu=1.0986
 )
 
-results_folder = 'results/tifon_new_split_ordered/should_be_the_best_vanilla_attn_p4'
+results_folder = 'results/tifon_final/batch2_vanilla_mlp_4'
+os.makedirs(results_folder, exist_ok=True)
+with open(results_folder + "/coefficients.json", "w") as f:
+    json.dump(coefficients, f)
+
 train_steps = 100000
 trainer = Trainer1D(
     diffusion,
-    dataset=train_dataset_merged,
-    dataset_test=test_dataset, # small_val_dataset is to avoid timeout when training on 2 GPUs
-    train_batch_size=16,
-    train_lr=0.00023944586926057682, #1e-4,
+    dataset=train_dataset,
+    dataset_test=val_dataset, # small_val_dataset is to avoid timeout when training on 2 GPUs
+    train_batch_size=8,
+    train_lr=0.0000893, # 0.0002, #1e-4,
     train_num_steps=train_steps,  # total training steps
     gradient_accumulate_every=1,  # gradient accumulation steps
     ema_decay=0.995,  # exponential moving average decay
@@ -192,16 +232,19 @@ trainer = Trainer1D(
     # mixed_precision_type='bf16',
     results_folder=results_folder,  # folder to save results to
     save_and_sample_every=20000,
-    eta_min_scheduler=4e-6,
+    eta_min_scheduler=1e-6,
     max_grad_norm=1.0,
     # use_cpu=True,
     use_muon=True,
-    compile_model=True,
-    split_batches=True
+    # compile_model=True,
+    split_batches=True,
+    muon_lr=1e-4,
+    muon_adjust_lr_fn="match_rms_adamw",
+    muon_weight_decay=1e-2,
 )
 # trainer.load(5)
-trainer.train()
 shutil.copy(__file__, os.path.join(results_folder, os.path.basename(__file__)))
+trainer.train()
 
 samples, seqs = trainer.eval_model(test_dataset, batch_size=32, use_autocast=True)
 
