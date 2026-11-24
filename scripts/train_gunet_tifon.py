@@ -6,12 +6,23 @@ regress the surface pressure coefficient from the flow conditions (alpha, mach).
 - The model / training loop follow scripts/train_gunet_onera.py: every node of the
   graph is a surface point with input features [x, z, alpha, mach] and the network
   predicts cp at that node (MSE loss, no diffusion).
+
+Options (defaults reproduce the plain run: TopK pooling, features [x, z, alpha, mach]):
+  --pooling stride   keep every other point along the surface instead of TopK pooling
+  --normals          add the outward surface normal (nx, nz) as node features
+  --arc-freqs K      add sin/cos(2^k * theta), k = 0..K-1, of the arc-length position
+                     theta = 2*pi*s/L (s measured from the leading edge, L = perimeter)
+  --out-head linear  per-point linear output layer instead of a GCNConv, so the output is
+                     not averaged with the neighbours (sharp jumps, e.g. at the leading edge)
+e.g. python scripts/train_gunet_tifon.py --pooling stride --normals --arc-freqs 8 --out-head linear
 """
 import pyLOM
 
 import os
 import json
+import math
 import shutil
+import argparse
 from functools import lru_cache
 from pathlib import Path
 
@@ -21,8 +32,8 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, TensorDataset
-from torch_geometric.nn import knn_graph
 from tqdm import tqdm
+from ema_pytorch import EMA
 
 from denoising_diffusion_pytorch.graph_unet_cfg_diffusion import ConditionedGraphUNet
 from cetaceo.evaluators import RegressionEvaluator
@@ -38,16 +49,63 @@ torch.backends.cuda.matmul.allow_tf32 = True
 H5_PATH = "/home/airbus/CETACEO_cp_interp/DATA/TIFON/rans5/outputs/CADGroup_3_stage_1_reordered.h5"
 SPLIT_PATH = "/home/airbus/CETACEO_cp_interp/TIFON/splitting/tifon_split_complete.json"
 SUBSPLITS = ["batch0", "batch1", "batch2"]
-RESULTS_DIR = Path("results/tifon_final/gunet_attn_h16")
+RESULTS_ROOT = Path("results/tifon_final")
 
-KNN_K = 2                 # neighbours per node when building the surface graph
+parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("--pooling", choices=["topk", "stride"], default="topk",
+                    help="topk: learned TopK pooling; stride: keep every other point along the surface")
+parser.add_argument("--normals", action="store_true", help="add the outward surface normal (nx, nz) as node features")
+parser.add_argument("--arc-freqs", type=int, default=0,
+                    help="number of sin/cos frequency pairs of the arc-length position (0 = none)")
+parser.add_argument("--surface-hops", type=int, default=1,
+                    help="connect each point to this many neighbours on each side along the surface")
+parser.add_argument("--out-head", choices=["gcn", "linear"], default="gcn",
+                    help="output layer: gcn (GCNConv, averages each point with its neighbours) or linear (per point)")
+parser.add_argument("--results-dir", type=Path, default=None,
+                    help="default: results/tifon_final/gunet_attn_h16_<options>_<training recipe>")
+args = parser.parse_args()
+
+POOLING = args.pooling
+USE_NORMALS = args.normals
+ARC_FREQS = args.arc_freqs
+SURFACE_HOPS = args.surface_hops
+OUT_HEAD = args.out_head
+
+# Training recipe. Previous runs (lr 1e-4, 30-40k steps, no EMA) were still improving when the
+# cosine schedule reached ETA_MIN, and the validation MSE jumped by up to 1.5x between checks.
 BATCH_SIZE = 8
 EVAL_BATCH_SIZE = 16
-TRAINING_ITERS = 30000
-LR = 1e-4
+TRAINING_ITERS = 60000    # was 40000
+LR = 3e-4                 # peak learning rate (was 1e-4)
+WARMUP_ITERS = 1000       # linear warmup to LR, then cosine decay to ETA_MIN
 ETA_MIN = 1e-6
+WEIGHT_DECAY = 1e-2
 MAX_GRAD_NORM = 1.0
-EVAL_EVERY = 5000         # validation + checkpoint frequency (in steps)
+EMA_DECAY = 0.995         # EMA of the weights, as in train_tifon.py; the EMA model is the one
+EMA_UPDATE_EVERY = 10     # validated, saved as best checkpoint and evaluated on test
+EVAL_EVERY = 5000         # validation + checkpoint frequency (in steps), was 5000
+
+# Model size. MODEL_DIM is the width of the first level; level i has MODEL_DIM * DIM_MULTS[i] channels.
+# The attention layers have their own width (ATTN_HEADS * ATTN_DIM_HEAD) and dominate the run time.
+MODEL_DIM = 256           # was 128 (9.7M params -> 20.9M); same run time, the attention size is unchanged
+DIM_MULTS = (1, 2, 2, 4)
+ATTENTION_LAYERS = [1, 2, 3]
+ATTN_HEADS = 16
+ATTN_DIM_HEAD = 64
+
+run_name = f"gunet_attn_h{ATTN_HEADS}_" + POOLING
+if SURFACE_HOPS != 1:
+    run_name += f"_hops{SURFACE_HOPS}"
+if USE_NORMALS:
+    run_name += "_normals"
+if ARC_FREQS > 0:
+    run_name += f"_arc{ARC_FREQS}"
+if OUT_HEAD != "gcn":
+    run_name += f"_{OUT_HEAD}head"
+if MODEL_DIM != 128:
+    run_name += f"_dim{MODEL_DIM}"
+run_name += f"_lr{LR:.0e}_{TRAINING_ITERS // 1000}k_ema"   # recipe, so new runs don't overwrite old ones
+RESULTS_DIR = args.results_dir or RESULTS_ROOT / run_name
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -129,17 +187,73 @@ test_conds = (test_conds - conds_mean) / conds_std
 
 coords = torch.tensor(mesh_coords, dtype=torch.float32)          # (N, 2), physical units
 coords_mean, coords_std = coords.mean(dim=0), coords.std(dim=0)
-node_coords = ((coords - coords_mean) / coords_std).T.contiguous().to(device)  # (2, N) node features
 num_points = coords.shape[0]
+
+# The graph and the geometric features below assume the points are ordered along the closed
+# surface, starting at the leading edge. Fail loudly if they are not.
+spacing = (coords - coords.roll(-1, dims=0)).norm(dim=1)   # includes the wrap N-1 -> 0
+assert spacing.max() < 5 * spacing.median(), (
+    f"Points do not look ordered along the surface: max spacing {spacing.max():.2e} "
+    f"vs median {spacing.median():.2e} (at index {spacing.argmax().item()})"
+)
+
+
+# Geometric node features.
+def surface_normals(xz):
+    """Outward unit normals (N, 2) from central differences along the closed curve."""
+    tangent = xz.roll(-1, dims=0) - xz.roll(1, dims=0)
+    tangent = tangent / tangent.norm(dim=1, keepdim=True)
+    normal = torch.stack([tangent[:, 1], -tangent[:, 0]], dim=1)   # outward for a counter-clockwise loop
+    nxt = xz.roll(-1, dims=0)
+    signed_area = 0.5 * (xz[:, 0] * nxt[:, 1] - nxt[:, 0] * xz[:, 1]).sum()
+    return normal if signed_area > 0 else -normal
+
+
+def arc_length_features(xz, num_freqs):
+    """sin/cos(2^k * theta), k < num_freqs, with theta = 2*pi*s/L (s from point 0, L = perimeter).
+
+    theta is periodic, so the features are continuous where the loop closes (the leading edge);
+    the higher frequencies resolve small distances along the surface, e.g. around the leading edge.
+    """
+    seg = (xz.roll(-1, dims=0) - xz).norm(dim=1)                   # seg[i] = |p[i+1] - p[i]|, wrapping
+    s = torch.cat([seg.new_zeros(1), seg[:-1].cumsum(0)])
+    theta = 2 * math.pi * s / seg.sum()
+    angles = theta[:, None] * (2.0 ** torch.arange(num_freqs))[None, :]
+    return torch.cat([angles.sin(), angles.cos()], dim=1)           # (N, 2 * num_freqs)
+
+
+feature_names = ["x", "z"]
+features = [(coords - coords_mean) / coords_std]                    # standardized coordinates
+if USE_NORMALS:
+    features.append(surface_normals(coords))                        # unit vectors, used as is
+    feature_names += ["nx", "nz"]
+if ARC_FREQS > 0:
+    features.append(arc_length_features(coords, ARC_FREQS))         # already in [-1, 1]
+    feature_names += [f"sin{2**k}" for k in range(ARC_FREQS)] + [f"cos{2**k}" for k in range(ARC_FREQS)]
+node_features = torch.cat(features, dim=1).T.contiguous().to(device)  # (F, N)
+in_channels = node_features.shape[0] + 2                               # + alpha, mach
+print(f"Node features ({in_channels}): {feature_names + ['alpha', 'mach']}")
 
 # No padding needed (unlike the DiT): the graph works on the raw number of surface points.
 train_dataset = TensorDataset(torch.tensor(train_cp).float(), torch.tensor(train_conds).float())
 val_dataset = TensorDataset(torch.tensor(val_cp).float(), torch.tensor(val_conds).float())
 test_dataset = TensorDataset(torch.tensor(test_cp).float(), torch.tensor(test_conds).float())
 
-# Graph connectivity: kNN on the physical coordinates. All samples share the same mesh.
-edge_index = knn_graph(coords, k=KNN_K, batch=None, loop=False).to(device)
-print(f"Graph: {num_points} nodes, {edge_index.shape[1]} edges (k={KNN_K})")
+# Graph connectivity. The surface points are stored in order along the airfoil (closed loop
+# starting and ending at the leading edge), so neighbours are taken by index instead of kNN:
+# point i <-> i±1..±SURFACE_HOPS, wrapping N-1 <-> 0 at the leading edge. Upper and lower
+# surfaces can then never be linked, however close they are. All samples share the same mesh.
+def surface_ring_graph(n, hops):
+    i = torch.arange(n)
+    src, dst = [], []
+    for h in range(1, hops + 1):
+        j = (i + h) % n
+        src += [i, j]
+        dst += [j, i]
+    return torch.stack([torch.cat(src), torch.cat(dst)])
+
+edge_index = surface_ring_graph(num_points, SURFACE_HOPS).to(device)
+print(f"Graph: {num_points} nodes, {edge_index.shape[1]} edges (ordered ring, ±{SURFACE_HOPS} neighbours)")
 
 coefficients = {
     "cp_mean": float(cp_mean),
@@ -149,7 +263,22 @@ coefficients = {
     "coords_mean": coords_mean.tolist(),
     "coords_std": coords_std.tolist(),
     "num_points": int(num_points),
-    "knn_k": KNN_K,
+    "graph": "surface_ring",
+    "surface_hops": SURFACE_HOPS,
+    "pooling": POOLING,
+    "normals": USE_NORMALS,
+    "arc_freqs": ARC_FREQS,
+    "out_head": OUT_HEAD,
+    "model": {
+        "dim": MODEL_DIM, "dim_mults": list(DIM_MULTS), "attention_layers": ATTENTION_LAYERS,
+        "attn_heads": ATTN_HEADS, "attn_dim_head": ATTN_DIM_HEAD,
+    },
+    "node_features": feature_names + ["alpha", "mach"],
+    "training": {
+        "batch_size": BATCH_SIZE, "iters": TRAINING_ITERS, "lr": LR, "warmup_iters": WARMUP_ITERS,
+        "eta_min": ETA_MIN, "weight_decay": WEIGHT_DECAY, "max_grad_norm": MAX_GRAD_NORM,
+        "ema_decay": EMA_DECAY, "ema_update_every": EMA_UPDATE_EVERY,
+    },
     "h5_path": H5_PATH,
 }
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -168,10 +297,10 @@ def get_batched_edge_index(batch_size):
 
 
 def build_inputs(conds):
-    """(B, 2) normalized conditions -> (B, 4, N) node features [x, z, alpha, mach]."""
+    """(B, 2) normalized conditions -> (B, F + 2, N) node features [geometry..., alpha, mach]."""
     b = conds.shape[0]
     return torch.cat(
-        [node_coords.unsqueeze(0).expand(b, -1, -1), conds.unsqueeze(-1).expand(-1, -1, num_points)],
+        [node_features.unsqueeze(0).expand(b, -1, -1), conds.unsqueeze(-1).expand(-1, -1, num_points)],
         dim=1,
     )
 
@@ -197,25 +326,39 @@ def cycle(dl):
 
 # ----------------------------- model -----------------------------
 model = ConditionedGraphUNet(
-    dim=128,
-    in_channels=4,  # x, z, alpha, mach
+    dim=MODEL_DIM,
+    in_channels=in_channels,  # geometric features + alpha, mach
     out_channels=1,  # cp
     # cond_dim=None -> conditions are given as node features, not embeddings
     cond_drop_prob=0.0,
-    attention_layers=[1, 2, 3],
-    dim_mults=(1, 2, 2, 4),
+    attention_layers=ATTENTION_LAYERS,
+    dim_mults=DIM_MULTS,
     pool_ratios=0.5,
     sum_res=True,
     act=torch.nn.GELU(),
-    attn_heads=16,
-    attn_dim_head=64,
+    attn_heads=ATTN_HEADS,
+    attn_dim_head=ATTN_DIM_HEAD,
+    pool_type=POOLING,
+    out_head=OUT_HEAD,
 )
 model.to(device)
 print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 print("Number trainable of parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
-optimizer = AdamW(model.parameters(), lr=LR, betas=(0.9, 0.99), weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TRAINING_ITERS, eta_min=ETA_MIN)
+optimizer = AdamW(model.parameters(), lr=LR, betas=(0.9, 0.99), weight_decay=WEIGHT_DECAY)
+
+
+def lr_factor(step):
+    """Linear warmup over WARMUP_ITERS steps, then cosine decay from LR to ETA_MIN at TRAINING_ITERS."""
+    if step < WARMUP_ITERS:
+        return (step + 1) / WARMUP_ITERS
+    progress = min(1.0, (step - WARMUP_ITERS) / max(1, TRAINING_ITERS - WARMUP_ITERS))
+    return ETA_MIN / LR + (1 - ETA_MIN / LR) * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+ema = EMA(model, beta=EMA_DECAY, update_every=EMA_UPDATE_EVERY)
+ema.to(device)
 
 
 # ----------------------------- training -----------------------------
@@ -224,7 +367,8 @@ if __name__ == "__main__":
 
     step = 0
     all_losses = []
-    val_losses = []  # (step, normalized val MSE)
+    val_losses = []      # (step, normalized val MSE) of the EMA model, used to pick the best checkpoint
+    val_losses_raw = []  # (step, normalized val MSE) of the raw (online) model, for reference
     best_val_loss = float("inf")
     model.train()
     with tqdm(total=TRAINING_ITERS) as pbar:
@@ -240,28 +384,34 @@ if __name__ == "__main__":
             torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
             optimizer.step()
             scheduler.step()
+            ema.update()
 
             step += 1
             all_losses.append(loss.item())
-            pbar.set_description(f'loss: {loss.item():.5f}')
+            pbar.set_description(f'loss: {loss.item():.5f} lr: {scheduler.get_last_lr()[0]:.2e}')
             pbar.update(1)
 
             if step % EVAL_EVERY == 0 or step == TRAINING_ITERS:
-                val_preds = predict(model, val_dataset)
-                val_loss = F.mse_loss(val_preds, val_dataset.tensors[0]).item()
+                val_targets = val_dataset.tensors[0]
+                val_loss = F.mse_loss(predict(ema.ema_model, val_dataset), val_targets).item()
+                val_loss_raw = F.mse_loss(predict(model, val_dataset), val_targets).item()
                 val_losses.append((step, val_loss))
+                val_losses_raw.append((step, val_loss_raw))
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    torch.save(model.state_dict(), RESULTS_DIR / "gunet_state_dict_best.pt")
+                    torch.save(ema.ema_model.state_dict(), RESULTS_DIR / "gunet_state_dict_best.pt")
                 torch.save({
                     "step": step,
                     "model": model.state_dict(),
+                    "ema_model": ema.ema_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
                     "loss_history": all_losses,
                     "val_losses": val_losses,
+                    "val_losses_raw": val_losses_raw,
                 }, RESULTS_DIR / "gunet_ckp_last.pt")
-                tqdm.write(f"step {step}: val MSE (normalized) {val_loss:.6f} | best {best_val_loss:.6f}")
+                tqdm.write(f"step {step}: val MSE (normalized) EMA {val_loss:.6f} | raw {val_loss_raw:.6f} "
+                           f"| best EMA {best_val_loss:.6f}")
 
     # loss curves
     plt.figure()
@@ -271,7 +421,8 @@ if __name__ == "__main__":
         moving_avg = np.convolve(all_losses, np.ones(window_size) / window_size, mode='valid')
         plt.plot(range(window_size - 1, len(all_losses)), moving_avg, label=f'Moving Avg ({window_size})')
     if val_losses:
-        plt.plot(*zip(*val_losses), 'o-', label='Validation loss')
+        plt.plot(*zip(*val_losses_raw), 'o-', label='Validation loss (raw model)', alpha=0.6)
+        plt.plot(*zip(*val_losses), 'o-', label='Validation loss (EMA model)')
     plt.yscale('log')
     plt.xlabel('Training Steps')
     plt.ylabel('MSE, normalized (log scale)')
@@ -280,7 +431,7 @@ if __name__ == "__main__":
     plt.savefig(RESULTS_DIR / "loss_evolution.png", bbox_inches="tight", pad_inches=0)
     plt.close()
 
-    # ----------------------------- test evaluation (best val checkpoint) -----------------------------
+    # ----------------------------- test evaluation (best val checkpoint, EMA weights) -----------------------------
     model.load_state_dict(torch.load(RESULTS_DIR / "gunet_state_dict_best.pt", map_location=device))
     test_preds = predict(model, test_dataset)
 

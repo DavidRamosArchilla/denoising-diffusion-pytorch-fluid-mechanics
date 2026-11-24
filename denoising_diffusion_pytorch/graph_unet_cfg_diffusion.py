@@ -9,6 +9,7 @@ from torch_geometric.typing import OptTensor, PairTensor
 from torch_geometric.utils import (
     add_self_loops,
     remove_self_loops,
+    subgraph,
     to_torch_csr_tensor,
 )
 
@@ -183,6 +184,8 @@ class GraphAttention(nn.Module):
         self.norm = RMSNorm(dim)
         self.to_qkv = GCNConv(dim, hidden_dim * 3, bias = False, improved=True)
         self.to_out = GCNConv(hidden_dim, dim, 1)
+        self.q_norm = nn.RMSNorm(dim_head)
+        self.k_norm = nn.RMSNorm(dim_head)
 
     def forward(self, x, edge_index, edge_weight):
         # b, c, h, w = x.shape
@@ -192,13 +195,18 @@ class GraphAttention(nn.Module):
         qkv = self.to_qkv(x, edge_index, edge_weight)# .chunk(3, dim = 1)
         qkv = rearrange(qkv, '(b n) c -> b c n', b=batch_size)
         qkv = qkv.chunk(3, dim=1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) n -> b h c n', h = self.heads), qkv)
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) n -> b h n c', h = self.heads), qkv)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
-        q = q * self.scale
-
-        sim = einsum('b h d i, b h d j -> b h i j', q, k)
-        attn = sim.softmax(dim = -1)
-        out = einsum('b h i j, b h d j -> b h i d', attn, v)
+        # q = q * self.scale 
+        # sim = einsum('b h d i, b h d j -> b h i j', q, k)
+        # attn = sim.softmax(dim = -1)
+        # out = einsum('b h i j, b h d j -> b h i d', attn, v)
+        # out = rearrange(out, 'b h n d -> b (h d) n')
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+        )
         out = rearrange(out, 'b h n d -> b (h d) n')
         out = rearrange(out, 'b c n -> (b n) c')
         out = self.to_out(out, edge_index, edge_weight)
@@ -281,6 +289,10 @@ class RMSNorm(nn.Module):
         return F.normalize(x, dim = 1) * self.g * (x.shape[1] ** 0.5)
 
 
+class IdentityMultiargs(nn.Identity):
+    def forward(self, *args, **kwargs):
+        return args[0]
+
 class ConditionedGraphUNet(torch.nn.Module):
     r"""The Graph U-Net model from the `"Graph U-Nets"
     <https://arxiv.org/abs/1905.05178>`_ paper which implements a U-Net like
@@ -298,6 +310,18 @@ class ConditionedGraphUNet(torch.nn.Module):
             summation. (default: :obj:`False`)
         act (torch.nn.functional, optional): The nonlinearity to use.
             (default: :obj:`torch.nn.functional.relu`)
+        pool_type (str, optional): :obj:`'topk'` uses learned TopKPooling (original
+            Graph U-Net). :obj:`'stride'` keeps every other node (0, 2, 4, ...) of each
+            sample and unpools by copying each coarse node back to its two fine nodes;
+            ``pool_ratios`` is then ignored (always a factor 2). Only use :obj:`'stride'`
+            when the nodes are ordered along a curve (e.g. airfoil surface points) and
+            neighbours in that order are connected, so the pooled graph stays a connected
+            curve at every level. (default: :obj:`'topk'`)
+        out_head (str, optional): :obj:`'gcn'` maps the last features to the output with a
+            GCNConv, which averages each node with its neighbours (original). :obj:`'linear'`
+            uses a per-node linear layer instead, so the output at a node is not smoothed
+            with its neighbours and sharp jumps between adjacent nodes are easier to
+            represent. (default: :obj:`'gcn'`)
     """
     def __init__(
         self,
@@ -307,13 +331,20 @@ class ConditionedGraphUNet(torch.nn.Module):
         cond_dim: int = None,
         cond_drop_prob=0.0,
         dim_mults=(1, 2, 4, 8),
+        attention_layers=[0, 1, 2, 3],
         pool_ratios: Union[float, List[float]] = 0.5,
         sum_res: bool = False,
         act: Union[str, Callable] = 'relu',
         attn_heads=4,
-        attn_dim_head=32
+        attn_dim_head=32,
+        pool_type: str = 'topk',
+        out_head: str = 'gcn',
     ):
         super().__init__()
+        assert pool_type in ('topk', 'stride'), f"pool_type must be 'topk' or 'stride', got {pool_type!r}"
+        assert out_head in ('gcn', 'linear'), f"out_head must be 'gcn' or 'linear', got {out_head!r}"
+        self.pool_type = pool_type
+        self.out_head = out_head
         self.in_channels = in_channels
         self.out_channels = out_channels
         # classifier free guidance stuff
@@ -360,20 +391,26 @@ class ConditionedGraphUNet(torch.nn.Module):
         for ind, (dim_in, dim_out) in enumerate(in_out):
             self.downs.append(nn.ModuleList([
                 GraphBlock(dim=dim_in, dim_out=dim_out, time_emb_dim=time_dim, classes_emb_dim=classes_dim),
-                GraphAttention(dim_out, attn_heads, attn_dim_head)
+                GraphAttention(dim_out, attn_heads, attn_dim_head) if ind in attention_layers else IdentityMultiargs()
             ]))
-            # pooling occurs after the GraphBlock
-            self.pools.append(TopKPooling(dim_out, self.pool_ratios[ind]))
+            # pooling occurs after the GraphBlock (stride pooling has no parameters)
+            self.pools.append(TopKPooling(dim_out, self.pool_ratios[ind]) if pool_type == 'topk' else nn.Identity())
 
         self.mid_block1 = GraphBlock(dim=dims[-1], dim_out=dims[-1], time_emb_dim=time_dim, classes_emb_dim=classes_dim)
         self.mid_attn = GraphAttention(dims[-1], attn_heads, attn_dim_head)
+        
+        depth = len(in_out)
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             in_channels = dim_out if sum_res else 2 * dim_out # dim_in + dim_out # 2 * dim_out #
+            mirrored_ind = depth - 1 - ind 
             self.ups.append(nn.ModuleList([
                 GraphBlock(dim=in_channels, dim_out=dim_in, time_emb_dim=time_dim, classes_emb_dim=classes_dim),
-                GraphAttention(dim_in, attn_heads, attn_dim_head)
+                GraphAttention(dim_in, attn_heads, attn_dim_head) if mirrored_ind in attention_layers else IdentityMultiargs()
             ]))
-        self.out_conv = GCNConv(dim, out_channels, improved=True)
+        if out_head == 'gcn':
+            self.out_conv = GCNConv(dim, out_channels, improved=True)
+        else:
+            self.out_conv = nn.Linear(dim, out_channels)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -383,10 +420,12 @@ class ConditionedGraphUNet(torch.nn.Module):
         self.out_conv.reset_parameters()
         for block, attn in self.downs:
             block.reset_parameters()
-            attn.reset_parameters()
+            if not isinstance(attn, nn.Identity):
+                attn.reset_parameters()
         for block, attn in self.ups:
             block.reset_parameters()
-            attn.reset_parameters()
+            if not isinstance(attn, nn.Identity):
+                attn.reset_parameters()
 
 
     def forward(self, x: Tensor, edge_index: Tensor,
@@ -430,8 +469,13 @@ class ConditionedGraphUNet(torch.nn.Module):
             edge_index, edge_weight = self.augment_adj(edge_index, edge_weight,
                                                        x.size(0)) #  * x.size(2)
             # print(f"block {i} x shape", x.shape, edge_index.shape)
-            x, edge_index, edge_weight, batch, perm, _ = self.pools[i](
-                x, edge_index, edge_weight, batch)
+            if self.pool_type == 'topk':
+                x, edge_index, edge_weight, batch, perm, _ = self.pools[i](
+                    x, edge_index, edge_weight, batch)
+            else:
+                # here perm holds, for every fine node, the index of its coarse node (used to unpool)
+                x, edge_index, edge_weight, perm = self.stride_pool(
+                    x, edge_index, edge_weight, batch_size)
             x = rearrange(x, '(b n) c -> b c n', b=batch_size)
             # print(f"block {i} x shape", x.shape, edge_index.shape)
             perms.append(perm)
@@ -450,8 +494,11 @@ class ConditionedGraphUNet(torch.nn.Module):
             x = rearrange(x, 'b c n -> (b n) c')
             res = rearrange(res, 'b c n -> (b n) c')
             # print(x.shape, res.shape, perm.shape)
-            up = torch.zeros_like(res)
-            up[perm] = x
+            if self.pool_type == 'topk':
+                up = torch.zeros_like(res)
+                up[perm] = x
+            else:
+                up = x[perm]  # nearest-neighbour unpooling: each fine node takes its coarse node's value
             x = res + up if self.sum_res else torch.cat((res, up), dim=-1)
 
             x = rearrange(x, '(b n) c -> b c n', b=batch_size)
@@ -460,7 +507,10 @@ class ConditionedGraphUNet(torch.nn.Module):
             # x = self.act(x)
 
         x = rearrange(x, 'b c n -> (b n) c')
-        x = self.out_conv(x, initial_edge_index, initial_edge_weight)
+        if self.out_head == 'gcn':
+            x = self.out_conv(x, initial_edge_index, initial_edge_weight)
+        else:
+            x = self.out_conv(x)  # per node, no mixing with neighbours
         x = rearrange(x, '(b n) c -> b c n', b=batch_size)
         return x
 
@@ -475,6 +525,26 @@ class ConditionedGraphUNet(torch.nn.Module):
         edge_index, edge_weight = adj.indices(), adj.values()
         edge_index, edge_weight = remove_self_loops(edge_index, edge_weight)
         return edge_index, edge_weight
+
+    @staticmethod
+    def stride_pool(x: Tensor, edge_index: Tensor, edge_weight: Tensor, batch_size: int):
+        """Keeps nodes 0, 2, 4, ... of every sample. x is (B*N, C), sample-major.
+
+        Called after augment_adj (A^2), so kept nodes two steps apart along the curve are
+        connected and the pooled graph is again a connected curve. Edge weights are reset to 1:
+        the A^2 path counts would otherwise grow level after level on the edge that closes the
+        loop when the node count is odd. Returns the pooled x, edge_index and edge_weight, plus
+        the coarse index of every fine node for unpooling.
+        """
+        num_nodes = x.size(0) // batch_size
+        keep = torch.arange(0, num_nodes, 2, device=x.device)
+        offsets = torch.arange(batch_size, device=x.device).unsqueeze(1)
+        perm = (offsets * num_nodes + keep).reshape(-1)  # sorted, so relabelled ids stay sample-major
+        edge_index, edge_weight = subgraph(perm, edge_index, edge_weight,
+                                           relabel_nodes=True, num_nodes=x.size(0))
+        fine = torch.arange(num_nodes, device=x.device)
+        parent = (offsets * keep.numel() + fine // 2).reshape(-1)
+        return x[perm], edge_index, torch.ones_like(edge_weight), parent
 
 
 class GraphDiffusion(nn.Module):

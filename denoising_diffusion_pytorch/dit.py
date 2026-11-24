@@ -810,9 +810,23 @@ class DiT(nn.Module):
 
 
 class DiTCoordPE(DiT):
-    def __init__(self, coords, *args, **kwargs):
+    """DiT with a Fourier coordinate PE added to the patch tokens.
+
+    ``coords`` (N, C) can be in any units: they are min-max normalized per axis
+    to [-1, 1] and scaled by ``COORD_ENC_SCALE`` so ``fourier_encode`` does not
+    alias. ``legacy_coord_encoding=True`` restores the old raw-coords / 32
+    frequencies behaviour, only needed to load checkpoints trained before the fix.
+    """
+    def __init__(self, coords, *args, coord_frequencies=10, legacy_coord_encoding=False, **kwargs):
         super().__init__(*args, **kwargs)
-        self.coord_embedder = CoordEmbedder(self.pos_embed.shape[-1], coords.shape[-1], num_frequencies=32)
+        coords = torch.as_tensor(coords, dtype=torch.float32)
+        if legacy_coord_encoding:
+            coord_frequencies = 32
+        else:
+            lo, hi = coords.amin(dim=0, keepdim=True), coords.amax(dim=0, keepdim=True)
+            coords = 2 * (coords - lo) / (hi - lo).clamp(min=1e-12) - 1
+            coords = COORD_ENC_SCALE * coords
+        self.coord_embedder = CoordEmbedder(self.pos_embed.shape[-1], coords.shape[-1], num_frequencies=coord_frequencies)
         # self.coords = coords
         self.register_buffer("coords", coords.unsqueeze(0)) # (1, N, C)
 
@@ -1036,9 +1050,16 @@ def get_1d_sincos_pos_embed(embed_dim, length):
     pos = np.arange(length, dtype=np.float32)
     return get_1d_sincos_pos_embed_from_grid(embed_dim, pos)
 
-def fourier_encode(coords, num_frequencies=32):
+# fourier_encode uses 2^k * 2*pi frequencies, so the encoding has period 1 and
+# x aliases with x +/- 1. Coords normalized to [-1, 1] must be scaled by this
+# (-> [-0.25, 0.25], within half a period) before encoding. Also keep
+# num_frequencies around 8-12: beyond 2^~17 * 2*pi the phase is lost in fp32.
+COORD_ENC_SCALE = 0.25
+
+
+def fourier_encode(coords, num_frequencies=16):
     """
-    coords: (N, C) where C is 2 or 3
+    coords: (N, C) where C is 2 or 3, expected in [-COORD_ENC_SCALE, COORD_ENC_SCALE]
     out: (N, C * 2 * num_frequencies)
     """
     freqs = 2.0 ** torch.arange(num_frequencies, device=coords.device)  # (F,)
@@ -1048,7 +1069,7 @@ def fourier_encode(coords, num_frequencies=32):
 
 
 class CoordEmbedder(nn.Module):
-    def __init__(self, embed_dim, coord_dim=3, num_frequencies=32):
+    def __init__(self, embed_dim, coord_dim=3, num_frequencies=16):
         super().__init__()
         in_dim = coord_dim * 2 * num_frequencies
         self.num_frequencies = num_frequencies
